@@ -727,6 +727,22 @@ html.lang-fa .btn { font-family: var(--font-fa); }
   border-color: var(--primary);
 }
 
+.btn-xs {
+  padding: 2px 10px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  border-radius: 5px;
+}
+
+.btn-danger-outline {
+  background: transparent;
+  border: 1px solid oklch(0.65 0.2 25);
+  color: oklch(0.75 0.18 25);
+}
+.btn-danger-outline:hover {
+  background: oklch(0.65 0.2 25 / 0.12);
+}
+
 .btn-sm {
   padding: 4px 12px;
   font-size: 0.75rem;
@@ -1462,38 +1478,246 @@ html.lang-fa .trade-preview-legend .swatch-dashed {
   background: var(--bg-secondary);
   border: 1px solid var(--border);
 }
-.trade-result .result-value.positive { color: var(--success); }
-.trade-result .result-value.negative { color: var(--danger); }
-
-/* Portfolio section (collapsible) */
-.portfolio-section {
-  margin-top: 16px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
+.trade-result .result-value.positive, .trade-result .positive { color: var(--success); }
+.trade-result .result-value.negative, .trade-result .negative { color: var(--danger); }
+.trade-result-footer {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
 }
-.portfolio-toggle {
+
+/* Trade preview mode (dashed, lighter) */
+.trade-preview-mode {
+  border-style: dashed;
+  opacity: 0.85;
+}
+.preview-header {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.preview-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.preview-cell {
+  flex: 1 1 auto;
+  min-width: 70px;
+  text-align: center;
+}
+.preview-cell-label {
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--text-muted);
+}
+.preview-cell-value {
+  font-size: 0.8rem;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  color: var(--primary-light);
+}
+.preview-cell-value.positive { color: var(--success); }
+.preview-cell-value.negative { color: var(--danger); }
+.preview-trader-bar {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+/* Smaller result grid/items for portfolio & trade results */
+.result-grid-sm {
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 6px;
+  margin: 8px 0;
+}
+.result-item-sm {
+  padding: 8px 6px;
+}
+.result-item-sm .result-label {
+  font-size: 0.6rem;
+}
+.result-value-sm {
+  font-size: 0.85rem !important;
+}
+
+/* Portfolio tab content */
+.portfolio-block {
+  margin-bottom: 16px;
+}
+.portfolio-heading {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--text-heading);
+  margin-bottom: 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.portfolio-sub {
+  margin-top: 10px;
+}
+.portfolio-subheading {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+/* Portfolio tables */
+.ptable-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.ptable {
   width: 100%;
+  border-collapse: collapse;
+  font-size: 0.75rem;
+}
+.ptable th {
+  text-align: left;
+  padding: 4px 8px;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+html.lang-fa .ptable th { text-align: right; }
+.ptable td {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  white-space: nowrap;
+}
+.ptable tbody tr:hover { background: var(--bg-card-hover); }
+.td-mono { font-family: var(--font-mono); font-size: 0.7rem; }
+.td-time { font-size: 0.65rem; color: var(--text-muted); }
+
+/* Trade type badges */
+.trade-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.6rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.badge-buy { background: var(--success-glow); color: var(--success); }
+.badge-sell { background: var(--danger-glow); color: var(--danger); }
+.badge-lp { background: var(--purple-glow); color: var(--purple); }
+
+/* Settings modal */
+.settings-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.5);
+  z-index: 200;
+  align-items: center;
+  justify-content: center;
+}
+.settings-overlay.open { display: flex; }
+.settings-modal {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  width: 90%;
+  max-width: 420px;
+  max-height: 80vh;
+  overflow-y: auto;
+  box-shadow: var(--shadow-lg);
+}
+.settings-title {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text-heading);
+  margin-bottom: 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.settings-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 4px;
+}
+.settings-close:hover { color: var(--text); }
+.settings-group {
+  margin-bottom: 16px;
+}
+.settings-group-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.settings-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.settings-row label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 0.78rem;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  transition: all var(--transition);
+}
+.settings-row label:has(input:checked) {
+  background: var(--primary);
+  color: white;
+  border-color: var(--primary);
+}
+.settings-row input[type="radio"] { display: none; }
+.settings-row input[type="range"] {
+  flex: 1;
+  min-width: 100px;
+}
+.settings-row input[type="checkbox"] {
+  accent-color: var(--primary);
+}
+.settings-precision-val {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: var(--primary-light);
+  min-width: 16px;
+  text-align: center;
+}
+.settings-toggle-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 14px;
-  background: var(--bg-secondary);
-  border: none;
+  padding: 6px 0;
+}
+.settings-toggle-row span {
+  font-size: 0.82rem;
   color: var(--text);
-  cursor: pointer;
-  font-size: 0.85rem;
-  font-weight: 600;
-  font-family: inherit;
-}
-.portfolio-toggle:hover { background: var(--bg-card-hover); }
-.portfolio-body {
-  padding: 10px 14px;
-  background: var(--bg-card);
-  display: none;
-}
-.portfolio-section.expanded .portfolio-body {
-  display: block;
 }
 
 /* Autosave dot (green/grey indicator beside Auto button) */
@@ -1582,6 +1806,9 @@ html.lang-fa .trade-preview-legend .swatch-dashed {
     </button>
     <button class="nav-btn" onclick="resetAllState()" title="Reset all state">
       <span class="lang-en">Reset</span><span class="lang-fa">پاک</span>
+    </button>
+    <button class="nav-btn" onclick="openSettingsModal()" title="Settings">
+      &#9881;
     </button>
     <button class="nav-btn" id="langToggle" onclick="toggleLanguage()">
       <span class="lang-en">FA</span>
@@ -1927,7 +2154,7 @@ html.lang-fa .trade-preview-legend .swatch-dashed {
     <div class="playground-toolbar" id="pgToolbar" style="display:none;">
       <div class="toolbar-group">
         <span class="toolbar-label"><span class="lang-en">Active Trader</span><span class="lang-fa">معامله‌گر فعال</span></span>
-        <select class="toolbar-select" id="activeTrader"></select>
+        <select class="toolbar-select" id="activeTrader" onchange="updatePortfolioTab(); updateDiscreteTradePreview(); updateDistTradePreview(); updateTradeResultFooters()"></select>
       </div>
       <div class="toolbar-group">
         <span class="toolbar-label"><span class="lang-en">Chart</span><span class="lang-fa">نمودار</span></span>
@@ -1957,6 +2184,9 @@ html.lang-fa .trade-preview-legend .swatch-dashed {
       </button>
       <button class="tab" onclick="switchTab('resolve', this)">
         <span class="lang-en">Resolve</span><span class="lang-fa">تعیین نتیجه</span>
+      </button>
+      <button class="tab" onclick="switchTab('portfolio', this)">
+        <span class="lang-en">Portfolio</span><span class="lang-fa">سبد</span>
       </button>
     </div>
 
@@ -2008,21 +2238,25 @@ html.lang-fa .trade-preview-legend .swatch-dashed {
         <button class="btn btn-primary" onclick="initPlayground()">
           <span class="lang-en">Create Market</span><span class="lang-fa">ایجاد بازار</span>
         </button>
+        <button class="btn btn-outline" onclick="openFeeModal()">
+          <span class="lang-en">&#9881; Fees</span><span class="lang-fa">&#9881; کارمزدها</span>
+        </button>
         <button class="btn btn-danger" onclick="resetPlayground()">
           <span class="lang-en">Reset</span><span class="lang-fa">بازنشانی</span>
         </button>
       </div>
+      <div id="feeDisplayInfo" style="display:none;margin-top:8px;"></div>
     </div>
 
     <!-- ===== Traders Tab ===== -->
     <div class="tab-content" id="tab-traders">
       <p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:16px;">
-        <span class="lang-en">Add traders and LP providers. The market creator is automatically registered as the initial LP.</span>
-        <span class="lang-fa">معامله‌گران و تأمین‌کنندگان نقدینگی اضافه کنید. سازنده بازار به عنوان LP اولیه ثبت می‌شود.</span>
+        <span class="lang-en">Traders are global and can trade on any market. LP providers are per-market. The market creator is automatically registered as the initial LP.</span>
+        <span class="lang-fa">معامله‌گران سراسری هستند و می‌توانند در هر بازاری معامله کنند. تأمین‌کنندگان نقدینگی مختص هر بازار هستند. سازنده بازار به عنوان LP اولیه ثبت می‌شود.</span>
       </p>
       <div class="demo-controls">
         <div class="control-group">
-          <span class="control-label"><span class="lang-en">Trader Name</span><span class="lang-fa">نام معامله‌گر</span></span>
+          <span class="control-label"><span class="lang-en">Name</span><span class="lang-fa">نام</span></span>
           <input type="text" class="control-input" id="traderNameInput" placeholder="Alice" style="font-family:inherit;">
         </div>
         <div class="control-group">
@@ -2031,13 +2265,14 @@ html.lang-fa .trade-preview-legend .swatch-dashed {
         </div>
       </div>
       <div class="btn-group">
-        <button class="btn btn-success" onclick="addTraderUI()">
+        <button class="btn btn-success" onclick="addGlobalTrader()">
           <span class="lang-en">Add Trader</span><span class="lang-fa">افزودن معامله‌گر</span>
         </button>
         <button class="btn btn-purple" onclick="addLpUI()">
           <span class="lang-en">Register LP Provider</span><span class="lang-fa">ثبت تأمین‌کننده نقدینگی</span>
         </button>
       </div>
+      <div id="globalTradersList" style="margin-top:12px;"></div>
       <div id="participantsList"></div>
       <!-- Top-up section -->
       <div class="topup-section">
@@ -2069,7 +2304,7 @@ html.lang-fa .trade-preview-legend .swatch-dashed {
         </div>
         <div class="control-group">
           <span class="control-label"><span class="lang-en">Amount</span><span class="lang-fa">مقدار</span></span>
-          <input type="number" class="control-input" id="pgDiscreteAmount" value="100000">
+          <input type="number" class="control-input" id="pgDiscreteAmount" value="100000" oninput="updateDiscreteTradePreview()">
         </div>
       </div>
       <!-- Bin slider -->
@@ -2101,6 +2336,8 @@ html.lang-fa .trade-preview-legend .swatch-dashed {
           <span class="lang-en">Sell</span><span class="lang-fa">فروش</span>
         </button>
       </div>
+      <div style="margin-top:8px;margin-bottom:4px;"><button class="btn btn-xs btn-outline" id="discretePreviewToggle" onclick="toggleDiscretePreviewMode()">Buy ▸ Sell</button> <span style="font-size:0.75rem;color:var(--text-muted);"><span class="lang-en">Toggle preview mode</span><span class="lang-fa">تغییر حالت پیش‌نمایش</span></span></div>
+      <div class="trade-result" id="discreteTradePreview" style="display:none;"></div>
       <div class="trade-result" id="discreteTradeResult" style="display:none;"></div>
     </div>
 
@@ -2140,7 +2377,7 @@ html.lang-fa .trade-preview-legend .swatch-dashed {
           </div>
           <div class="control-group">
             <span class="control-label"><span class="lang-en">Amount</span><span class="lang-fa">مقدار</span></span>
-            <input type="number" class="control-input" id="pgDistAmount" value="200000">
+            <input type="number" class="control-input" id="pgDistAmount" value="200000" oninput="updateDistTradePreview()">
           </div>
         </div>
       </div>
@@ -2164,6 +2401,8 @@ html.lang-fa .trade-preview-legend .swatch-dashed {
           <span class="lang-en">Distribution Sell</span><span class="lang-fa">فروش توزیعی</span>
         </button>
       </div>
+      <div style="margin-top:8px;margin-bottom:4px;"><button class="btn btn-xs btn-outline" id="distPreviewToggle" onclick="toggleDistPreviewMode()">Buy ▸ Sell</button> <span style="font-size:0.75rem;color:var(--text-muted);"><span class="lang-en">Toggle preview mode</span><span class="lang-fa">تغییر حالت پیش‌نمایش</span></span></div>
+      <div class="trade-result" id="distTradePreview" style="display:none;"></div>
       <div class="trade-result" id="distTradeResult" style="display:none;"></div>
     </div>
 
@@ -2217,13 +2456,14 @@ html.lang-fa .trade-preview-legend .swatch-dashed {
       <div id="payoutsSection" style="display:none;"></div>
     </div>
 
-    <!-- Portfolio (collapsible, shown after trades) -->
-    <div class="portfolio-section" id="portfolioSection" style="display:none;">
-      <button class="portfolio-toggle" onclick="this.parentElement.classList.toggle('expanded'); this.querySelector('.expand-arrow').textContent = this.parentElement.classList.contains('expanded') ? '\u25B2' : '\u25BC';">
-        <span><span class="lang-en">Portfolio Summary</span><span class="lang-fa">خلاصه سبد</span></span>
-        <span class="expand-arrow">&#9660;</span>
-      </button>
-      <div class="portfolio-body" id="portfolioBody"></div>
+    <!-- ===== Portfolio Tab ===== -->
+    <div class="tab-content" id="tab-portfolio">
+      <div id="portfolioTabContent">
+        <p style="color:var(--text-muted);font-size:0.85rem;">
+          <span class="lang-en">Create a market and make trades to see portfolio data.</span>
+          <span class="lang-fa">یک بازار بسازید و معامله کنید تا داده‌های سبد را ببینید.</span>
+        </p>
+      </div>
     </div>
 
     <!-- Results grid -->
@@ -2695,6 +2935,116 @@ html.lang-fa .trade-preview-legend .swatch-dashed {
      ============================================================ -->
 <div class="toast-container" id="toastContainer"></div>
 <div class="save-indicator" id="saveIndicator"></div>
+
+<!-- ============================================================
+     SETTINGS MODAL
+     ============================================================ -->
+<div class="settings-overlay" id="settingsModal" onclick="if(event.target===this)closeSettingsModal()">
+  <div class="settings-modal">
+    <div class="settings-title">
+      <span><span class="lang-en">Settings</span><span class="lang-fa">تنظیمات</span></span>
+      <button class="settings-close" onclick="closeSettingsModal()">&times;</button>
+    </div>
+
+    <div class="settings-group">
+      <div class="settings-group-label"><span class="lang-en">Font Size</span><span class="lang-fa">اندازه فونت</span></div>
+      <div class="settings-row">
+        <label><input type="radio" name="setFontSize" value="xs" onchange="applySetting('fontSize','xs')">XS</label>
+        <label><input type="radio" name="setFontSize" value="sm" onchange="applySetting('fontSize','sm')">S</label>
+        <label><input type="radio" name="setFontSize" value="md" onchange="applySetting('fontSize','md')" checked>M</label>
+        <label><input type="radio" name="setFontSize" value="lg" onchange="applySetting('fontSize','lg')">L</label>
+        <label><input type="radio" name="setFontSize" value="xl" onchange="applySetting('fontSize','xl')">XL</label>
+      </div>
+    </div>
+
+    <div class="settings-group">
+      <div class="settings-group-label"><span class="lang-en">Number Format</span><span class="lang-fa">فرمت اعداد</span></div>
+      <div class="settings-row">
+        <label><input type="radio" name="setNumFmt" value="short" onchange="applySetting('numberFormat','short')" checked><span class="lang-en">Short (1.2M)</span><span class="lang-fa">کوتاه (1.2M)</span></label>
+        <label><input type="radio" name="setNumFmt" value="long" onchange="applySetting('numberFormat','long')"><span class="lang-en">Long (1,200,000)</span><span class="lang-fa">کامل (1,200,000)</span></label>
+      </div>
+    </div>
+
+    <div class="settings-group">
+      <div class="settings-group-label"><span class="lang-en">Decimal Precision</span><span class="lang-fa">دقت اعشار</span></div>
+      <div class="settings-row">
+        <input type="range" id="setPrecision" min="0" max="6" value="1" oninput="applySetting('decimalPrecision',this.value)">
+        <span class="settings-precision-val" id="setPrecisionVal">1</span>
+      </div>
+    </div>
+
+    <div class="settings-group">
+      <div class="settings-group-label"><span class="lang-en">Appearance</span><span class="lang-fa">ظاهر</span></div>
+      <div class="settings-toggle-row">
+        <span><span class="lang-en">Dark Mode</span><span class="lang-fa">حالت تیره</span></span>
+        <button class="nav-btn" onclick="applySetting('theme', currentTheme==='dark'?'light':'dark')" style="padding:4px 12px;">
+          <span id="settingsThemeIcon">&#9790;</span>
+        </button>
+      </div>
+      <div class="settings-toggle-row">
+        <span><span class="lang-en">Language</span><span class="lang-fa">زبان</span></span>
+        <button class="nav-btn" onclick="applySetting('language', currentLang==='en'?'fa':'en')" style="padding:4px 12px;">
+          <span class="lang-en">FA</span><span class="lang-fa">EN</span>
+        </button>
+      </div>
+      <div class="settings-toggle-row">
+        <span><span class="lang-en">Autosave</span><span class="lang-fa">ذخیره خودکار</span></span>
+        <input type="checkbox" id="setAutosave" onchange="applySetting('autosave',this.checked)">
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================
+     FEE CONFIGURATION MODAL
+     ============================================================ -->
+<div class="settings-overlay" id="feeModal" onclick="if(event.target===this)closeFeeModal()">
+  <div class="settings-modal">
+    <div class="settings-title">
+      <span><span class="lang-en">Market Fees</span><span class="lang-fa">کارمزدهای بازار</span></span>
+      <button class="settings-close" onclick="closeFeeModal()">&times;</button>
+    </div>
+    <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:16px;">
+      <span class="lang-en">Set fees for the next market you create. All default to 0.</span>
+      <span class="lang-fa">کارمزدها برای بازار بعدی که ایجاد می‌کنید تنظیم شود. همه پیش‌فرض ۰ هستند.</span>
+    </p>
+    <div class="settings-group">
+      <div class="settings-group-label"><span class="lang-en">Trade Fee (bps)</span><span class="lang-fa">کارمزد معامله (bps)</span></div>
+      <div class="settings-row">
+        <input type="number" class="control-input" id="feeTradeFeeBps" value="0" min="0" max="1000" style="width:100px;">
+        <span style="font-size:0.75rem;color:var(--text-muted);margin-left:8px;">
+          <span class="lang-en">1 bps = 0.01%. E.g. 30 = 0.3%</span>
+          <span class="lang-fa">۱ bps = ۰٫۰۱٪. مثال: ۳۰ = ۰٫۳٪</span>
+        </span>
+      </div>
+    </div>
+    <div class="settings-group">
+      <div class="settings-group-label"><span class="lang-en">LP Fee Share (%)</span><span class="lang-fa">سهم LP از کارمزد (٪)</span></div>
+      <div class="settings-row">
+        <input type="number" class="control-input" id="feeLpFeeSharePct" value="0" min="0" max="100" style="width:100px;">
+        <span style="font-size:0.75rem;color:var(--text-muted);margin-left:8px;">
+          <span class="lang-en">% of trade fee directed to LPs</span>
+          <span class="lang-fa">٪ کارمزد معامله به LPها</span>
+        </span>
+      </div>
+    </div>
+    <div class="settings-group">
+      <div class="settings-group-label"><span class="lang-en">Redemption Fee (bps)</span><span class="lang-fa">کارمزد بازخرید (bps)</span></div>
+      <div class="settings-row">
+        <input type="number" class="control-input" id="feeRedemptionFeeBps" value="0" min="0" max="1000" style="width:100px;">
+        <span style="font-size:0.75rem;color:var(--text-muted);margin-left:8px;">
+          <span class="lang-en">Deducted from winning tokens at resolution</span>
+          <span class="lang-fa">از توکن‌های برنده هنگام تعیین نتیجه کسر می‌شود</span>
+        </span>
+      </div>
+    </div>
+    <div style="margin-top:16px;">
+      <button class="btn btn-primary" onclick="closeFeeModal()">
+        <span class="lang-en">Done</span><span class="lang-fa">تمام</span>
+      </button>
+    </div>
+  </div>
+</div>
 
 <!-- ============================================================
      ACTION LOG BOTTOM PANEL

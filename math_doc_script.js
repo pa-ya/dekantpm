@@ -1,8 +1,8 @@
 // ============================================================
 // DekantPM — Mathematical Analysis Interactive Script
 // ============================================================
-// Extracted from MATH_ANALYSIS_INTERACTIVE.html for maintainability.
-// Supports multi-market, localStorage save/load, enhanced trading info.
+// Supports multi-market, global traders, per-market fees,
+// localStorage save/load with resolve state persistence.
 // ============================================================
 
 'use strict';
@@ -10,13 +10,13 @@
 // ============================================================
 // 1. CONFIGURATION & CONSTANTS
 // ============================================================
-var TRADE_FEE_BPS = 30;
-var LP_FEE_SHARE_PCT = 50;
-var REDEMPTION_FEE_BPS = 50;
+var DEFAULT_TRADE_FEE_BPS = 0;
+var DEFAULT_LP_FEE_SHARE_PCT = 0;
+var DEFAULT_REDEMPTION_FEE_BPS = 0;
 var SCALE_WEIGHT = 1e9;
 var Z_CUTOFF = 5;
 var AUTOSAVE_INTERVAL_MS = 5000;
-var STORAGE_KEY = 'dekantpm_math_state';
+var STORAGE_KEY = 'dekantpm_math_state_v3';
 
 // ============================================================
 // 2. GLOBAL STATE
@@ -24,8 +24,11 @@ var STORAGE_KEY = 'dekantpm_math_state';
 var currentLang = 'en';
 var currentTheme = 'dark';
 
+// Global traders (shared across all markets)
+var globalTraders = {};  // { name: { wallet } }  — per-market spent/received tracked in traderHoldings
+
 // Multi-market
-var markets = [];          // { id, question, market, actionCount }
+var markets = [];          // { id, question, market, actionCount, tradeHistory }
 var currentMarketIdx = -1;
 var nextMarketId = 1;
 var market = null;         // alias for markets[currentMarketIdx].market
@@ -47,6 +50,13 @@ var actionLogEntries = [];
 var stateHasChanged = false;
 var autosaveEnabled = false;
 var autosaveTimerId = null;
+
+// Settings (user preferences, persisted)
+var settings = {
+  fontSize: 'md',         // xs, sm, md, lg, xl
+  numberFormat: 'short',  // short, long
+  decimalPrecision: 1,    // 0-6
+};
 
 // ============================================================
 // 3. LANGUAGE & THEME
@@ -73,6 +83,12 @@ function applyHtmlClass() {
 }
 
 applyHtmlClass();
+
+function applyFontSize(size) {
+  settings.fontSize = size || 'md';
+  var map = { xs: '13px', sm: '14px', md: '16px', lg: '18px', xl: '20px' };
+  document.documentElement.style.fontSize = map[settings.fontSize] || '16px';
+}
 
 // ============================================================
 // 4. SIDEBAR & NAVIGATION
@@ -225,10 +241,6 @@ function generateRandomQuestion() {
   return pick(templates)();
 }
 
-function randomizeQuestion() {
-  document.getElementById('pgQuestion').value = generateRandomQuestion();
-}
-
 // ============================================================
 // 10. BINS SELECT HANDLER
 // ============================================================
@@ -255,12 +267,17 @@ function getSelectedBins() {
 // ============================================================
 // 11. CONTINUOUS MARKET ENGINE
 // ============================================================
-function ContinuousMarket(N, rangeMin, rangeMax, liquidity) {
+function ContinuousMarket(N, rangeMin, rangeMax, liquidity, fees) {
   this.N = N;
   this.rangeMin = rangeMin;
   this.rangeMax = rangeMax;
   this.binWidth = (rangeMax - rangeMin) / N;
   this.k = liquidity;
+
+  // Per-market fee config
+  this.tradeFeeBps = (fees && typeof fees.tradeFeeBps === 'number') ? fees.tradeFeeBps : DEFAULT_TRADE_FEE_BPS;
+  this.lpFeeSharePct = (fees && typeof fees.lpFeeSharePct === 'number') ? fees.lpFeeSharePct : DEFAULT_LP_FEE_SHARE_PCT;
+  this.redemptionFeeBps = (fees && typeof fees.redemptionFeeBps === 'number') ? fees.redemptionFeeBps : DEFAULT_REDEMPTION_FEE_BPS;
 
   var xUniform = Math.sqrt(liquidity * liquidity / N);
   this.positions = [];
@@ -274,9 +291,12 @@ function ContinuousMarket(N, rangeMin, rangeMax, liquidity) {
   this.lpProviders = {};
   this.lpProviders['Creator'] = { shares: liquidity, deposited: liquidity };
   this.accumulatedLpFees = 0;
-  this.traders = {};
+  // Per-market holdings: { traderName: { holdings: [...] } }
+  this.traderHoldings = {};
   this.resolved = false;
   this.winningBin = -1;
+  this.lastResolveValue = null;
+  this.lastResolvePayouts = null;
 }
 
 ContinuousMarket.prototype.getProbabilities = function() {
@@ -302,12 +322,12 @@ ContinuousMarket.prototype.getLabels = function() {
   return labels;
 };
 
-ContinuousMarket.prototype.addTrader = function(name, wallet) {
-  if (this.traders[name]) return false;
-  var holdings = [];
-  for (var i = 0; i < this.N; i++) holdings.push(0);
-  this.traders[name] = { holdings: holdings, wallet: wallet, totalSpent: 0, totalReceived: 0 };
-  return true;
+ContinuousMarket.prototype.ensureTrader = function(name) {
+  if (!this.traderHoldings[name]) {
+    var holdings = [];
+    for (var i = 0; i < this.N; i++) holdings.push(0);
+    this.traderHoldings[name] = { holdings: holdings, spent: 0, received: 0 };
+  }
 };
 
 ContinuousMarket.prototype.addLpProvider = function(name) {
@@ -319,12 +339,15 @@ ContinuousMarket.prototype.addLpProvider = function(name) {
 ContinuousMarket.prototype.discreteBuy = function(traderName, binIdx, grossCollateral) {
   if (this.resolved) return { error: 'Market is resolved' };
   if (binIdx < 0 || binIdx >= this.N) return { error: 'Invalid bin index' };
-  var trader = this.traders[traderName];
-  if (!trader) return { error: 'Unknown trader: ' + traderName };
-  if (trader.wallet < grossCollateral) return { error: 'Insufficient wallet balance' };
+  var gt = globalTraders[traderName];
+  if (!gt) return { error: 'Unknown trader: ' + traderName };
+  if (gt.wallet < grossCollateral) return { error: 'Insufficient wallet balance' };
 
-  var fee = Math.floor(grossCollateral * TRADE_FEE_BPS / 10000);
-  var lpFee = Math.floor(fee * LP_FEE_SHARE_PCT / 100);
+  this.ensureTrader(traderName);
+  var th = this.traderHoldings[traderName];
+
+  var fee = Math.floor(grossCollateral * this.tradeFeeBps / 10000);
+  var lpFee = Math.floor(fee * this.lpFeeSharePct / 100);
   var net = grossCollateral - fee;
 
   var kNew = this.k + net;
@@ -340,12 +363,11 @@ ContinuousMarket.prototype.discreteBuy = function(traderName, binIdx, grossColla
   this.k = kNew;
   this.accumulatedLpFees += lpFee;
 
-  trader.holdings[binIdx] += tokensOut;
-  trader.wallet -= grossCollateral;
-  trader.totalSpent += grossCollateral;
+  th.holdings[binIdx] += tokensOut;
+  th.spent += grossCollateral;
+  gt.wallet -= grossCollateral;
 
-  // Peak payout if this bin wins
-  var peakPayout = tokensOut * (1 - REDEMPTION_FEE_BPS / 10000);
+  var peakPayout = tokensOut * (1 - this.redemptionFeeBps / 10000);
 
   return { tokensOut: tokensOut, fee: fee, lpFee: lpFee, net: net,
            newProb: (newXi * newXi) / (kNew * kNew),
@@ -356,9 +378,11 @@ ContinuousMarket.prototype.discreteBuy = function(traderName, binIdx, grossColla
 ContinuousMarket.prototype.discreteSell = function(traderName, binIdx, tokenAmount) {
   if (this.resolved) return { error: 'Market is resolved' };
   if (binIdx < 0 || binIdx >= this.N) return { error: 'Invalid bin index' };
-  var trader = this.traders[traderName];
-  if (!trader) return { error: 'Unknown trader: ' + traderName };
-  if (trader.holdings[binIdx] < tokenAmount - 0.01) return { error: 'Insufficient tokens in bin ' + binIdx };
+  var gt = globalTraders[traderName];
+  if (!gt) return { error: 'Unknown trader: ' + traderName };
+  this.ensureTrader(traderName);
+  var th = this.traderHoldings[traderName];
+  if (th.holdings[binIdx] < tokenAmount - 0.01) return { error: 'Insufficient tokens in bin ' + binIdx };
 
   var newXi = this.positions[binIdx] - tokenAmount;
   if (newXi < 0) return { error: 'Position would go negative' };
@@ -371,17 +395,17 @@ ContinuousMarket.prototype.discreteSell = function(traderName, binIdx, tokenAmou
   var kNew = Math.sqrt(sumSq);
   var grossOut = this.k - kNew;
 
-  var fee = Math.floor(grossOut * TRADE_FEE_BPS / 10000);
-  var lpFee = Math.floor(fee * LP_FEE_SHARE_PCT / 100);
+  var fee = Math.floor(grossOut * this.tradeFeeBps / 10000);
+  var lpFee = Math.floor(fee * this.lpFeeSharePct / 100);
   var netOut = grossOut - fee;
 
   this.positions[binIdx] = newXi;
   this.k = kNew;
   this.accumulatedLpFees += lpFee;
 
-  trader.holdings[binIdx] -= tokenAmount;
-  trader.wallet += netOut;
-  trader.totalReceived += netOut;
+  th.holdings[binIdx] -= tokenAmount;
+  th.received += netOut;
+  gt.wallet += netOut;
 
   return { collateralOut: netOut, grossOut: grossOut, fee: fee, lpFee: lpFee,
            tokensReturned: tokenAmount };
@@ -408,12 +432,15 @@ ContinuousMarket.prototype._computeWeights = function(mu, sigma) {
 
 ContinuousMarket.prototype.distributionBuy = function(traderName, mu, sigma, grossCollateral) {
   if (this.resolved) return { error: 'Market is resolved' };
-  var trader = this.traders[traderName];
-  if (!trader) return { error: 'Unknown trader: ' + traderName };
-  if (trader.wallet < grossCollateral) return { error: 'Insufficient wallet balance' };
+  var gt = globalTraders[traderName];
+  if (!gt) return { error: 'Unknown trader: ' + traderName };
+  if (gt.wallet < grossCollateral) return { error: 'Insufficient wallet balance' };
 
-  var fee = Math.floor(grossCollateral * TRADE_FEE_BPS / 10000);
-  var lpFee = Math.floor(fee * LP_FEE_SHARE_PCT / 100);
+  this.ensureTrader(traderName);
+  var th = this.traderHoldings[traderName];
+
+  var fee = Math.floor(grossCollateral * this.tradeFeeBps / 10000);
+  var lpFee = Math.floor(fee * this.lpFeeSharePct / 100);
   var net = grossCollateral - fee;
 
   var W = this._computeWeights(mu, sigma);
@@ -439,16 +466,16 @@ ContinuousMarket.prototype.distributionBuy = function(traderName, mu, sigma, gro
     var t = (lambda * W[j]) / W2;
     tokensPerBin.push(t);
     this.positions[j] += t;
-    trader.holdings[j] += t;
+    th.holdings[j] += t;
     totalTokens += t;
     if (t > maxTokensInBin) { maxTokensInBin = t; peakBin = j; }
   }
   this.k = kNew;
   this.accumulatedLpFees += lpFee;
-  trader.wallet -= grossCollateral;
-  trader.totalSpent += grossCollateral;
+  th.spent += grossCollateral;
+  gt.wallet -= grossCollateral;
 
-  var peakPayout = maxTokensInBin * (1 - REDEMPTION_FEE_BPS / 10000);
+  var peakPayout = maxTokensInBin * (1 - this.redemptionFeeBps / 10000);
 
   return { tokensPerBin: tokensPerBin, totalTokens: totalTokens, fee: fee, lpFee: lpFee, net: net,
            peakPayout: peakPayout, peakBin: peakBin, cost: grossCollateral,
@@ -457,8 +484,11 @@ ContinuousMarket.prototype.distributionBuy = function(traderName, mu, sigma, gro
 
 ContinuousMarket.prototype.distributionSell = function(traderName, mu, sigma, totalTokens) {
   if (this.resolved) return { error: 'Market is resolved' };
-  var trader = this.traders[traderName];
-  if (!trader) return { error: 'Unknown trader: ' + traderName };
+  var gt = globalTraders[traderName];
+  if (!gt) return { error: 'Unknown trader: ' + traderName };
+
+  this.ensureTrader(traderName);
+  var th = this.traderHoldings[traderName];
 
   var W = this._computeWeights(mu, sigma);
   if (!W) return { error: 'All bins outside 5 sigma' };
@@ -466,7 +496,7 @@ ContinuousMarket.prototype.distributionSell = function(traderName, mu, sigma, to
   var tokensPerBin = [];
   for (var j = 0; j < this.N; j++) {
     var t = totalTokens * W[j] / SCALE_WEIGHT;
-    t = Math.min(t, trader.holdings[j]);
+    t = Math.min(t, th.holdings[j]);
     t = Math.min(t, this.positions[j]);
     tokensPerBin.push(t);
   }
@@ -476,7 +506,7 @@ ContinuousMarket.prototype.distributionSell = function(traderName, mu, sigma, to
   var totalSold = 0;
   for (var j = 0; j < this.N; j++) {
     this.positions[j] -= tokensPerBin[j];
-    trader.holdings[j] -= tokensPerBin[j];
+    th.holdings[j] -= tokensPerBin[j];
     sumSq += this.positions[j] * this.positions[j];
     totalSold += tokensPerBin[j];
   }
@@ -484,14 +514,14 @@ ContinuousMarket.prototype.distributionSell = function(traderName, mu, sigma, to
 
   var kNew = Math.sqrt(sumSq);
   var grossOut = oldK - kNew;
-  var fee = Math.floor(grossOut * TRADE_FEE_BPS / 10000);
-  var lpFee = Math.floor(fee * LP_FEE_SHARE_PCT / 100);
+  var fee = Math.floor(grossOut * this.tradeFeeBps / 10000);
+  var lpFee = Math.floor(fee * this.lpFeeSharePct / 100);
   var netOut = grossOut - fee;
 
   this.k = kNew;
   this.accumulatedLpFees += lpFee;
-  trader.wallet += netOut;
-  trader.totalReceived += netOut;
+  th.received += netOut;
+  gt.wallet += netOut;
 
   return { tokensPerBin: tokensPerBin, totalSold: totalSold, collateralOut: netOut,
            grossOut: grossOut, fee: fee, lpFee: lpFee };
@@ -547,20 +577,21 @@ ContinuousMarket.prototype.resolve = function(value) {
   bin = Math.max(0, Math.min(this.N - 1, bin));
   this.resolved = true;
   this.winningBin = bin;
+  this.lastResolveValue = value;
 
   var payouts = [];
   var hWin = this.k - this.positions[bin];
 
-  for (var name in this.traders) {
-    var trader = this.traders[name];
-    var winTokens = trader.holdings[bin];
-    var redemptionFee = winTokens * REDEMPTION_FEE_BPS / 10000;
+  for (var name in this.traderHoldings) {
+    var th = this.traderHoldings[name];
+    var winTokens = th.holdings[bin];
+    var redemptionFee = winTokens * this.redemptionFeeBps / 10000;
     var payout = winTokens - redemptionFee;
     payouts.push({
       name: name, type: 'Trader',
       detail: Math.floor(winTokens).toLocaleString() + ' tokens',
-      payout: payout, spent: trader.totalSpent, received: trader.totalReceived,
-      netPnL: payout + trader.totalReceived - trader.totalSpent
+      payout: payout, spent: th.spent, received: th.received,
+      netPnL: payout + th.received - th.spent
     });
   }
 
@@ -579,13 +610,25 @@ ContinuousMarket.prototype.resolve = function(value) {
     });
   }
 
+  this.lastResolvePayouts = payouts;
   return { winningBin: bin, payouts: payouts };
 };
 
 // Portfolio valuation for a trader (expected payout at current probabilities)
 ContinuousMarket.prototype.getTraderPortfolio = function(traderName) {
-  var trader = this.traders[traderName];
-  if (!trader) return null;
+  var gt = globalTraders[traderName];
+  if (!gt) return null;
+  var th = this.traderHoldings[traderName];
+  var mSpent = th ? th.spent : 0;
+  var mReceived = th ? th.received : 0;
+  if (!th) {
+    return {
+      totalHoldings: 0, expectedPayout: 0, peakPayout: 0, peakBin: 0,
+      wallet: gt.wallet, totalSpent: mSpent, totalReceived: mReceived,
+      unrealizedPnL: mReceived - mSpent,
+      pnlPct: 0
+    };
+  }
 
   var probs = this.getProbabilities();
   var expectedPayout = 0;
@@ -593,23 +636,23 @@ ContinuousMarket.prototype.getTraderPortfolio = function(traderName) {
   var peakBin = 0;
   var peakTokens = 0;
   for (var j = 0; j < this.N; j++) {
-    var h = trader.holdings[j];
+    var h = th.holdings[j];
     totalHoldings += h;
-    expectedPayout += probs[j] * h * (1 - REDEMPTION_FEE_BPS / 10000);
+    expectedPayout += probs[j] * h * (1 - this.redemptionFeeBps / 10000);
     if (h > peakTokens) { peakTokens = h; peakBin = j; }
   }
-  var peakPayout = peakTokens * (1 - REDEMPTION_FEE_BPS / 10000);
-  var unrealizedPnL = expectedPayout + trader.totalReceived - trader.totalSpent;
-  var pnlPct = trader.totalSpent > 0 ? (unrealizedPnL / trader.totalSpent * 100) : 0;
+  var peakPayout = peakTokens * (1 - this.redemptionFeeBps / 10000);
+  var unrealizedPnL = expectedPayout + mReceived - mSpent;
+  var pnlPct = mSpent > 0 ? (unrealizedPnL / mSpent * 100) : 0;
 
   return {
     totalHoldings: totalHoldings,
     expectedPayout: expectedPayout,
     peakPayout: peakPayout,
     peakBin: peakBin,
-    wallet: trader.wallet,
-    totalSpent: trader.totalSpent,
-    totalReceived: trader.totalReceived,
+    wallet: gt.wallet,
+    totalSpent: mSpent,
+    totalReceived: mReceived,
     unrealizedPnL: unrealizedPnL,
     pnlPct: pnlPct
   };
@@ -622,11 +665,14 @@ function serializeMarket(m) {
   return {
     N: m.N, rangeMin: m.rangeMin, rangeMax: m.rangeMax, binWidth: m.binWidth,
     k: m.k, positions: m.positions.slice(), centers: m.centers.slice(),
+    tradeFeeBps: m.tradeFeeBps, lpFeeSharePct: m.lpFeeSharePct, redemptionFeeBps: m.redemptionFeeBps,
     totalLpShares: m.totalLpShares,
     lpProviders: JSON.parse(JSON.stringify(m.lpProviders)),
     accumulatedLpFees: m.accumulatedLpFees,
-    traders: JSON.parse(JSON.stringify(m.traders)),
+    traderHoldings: JSON.parse(JSON.stringify(m.traderHoldings)),
     resolved: m.resolved, winningBin: m.winningBin,
+    lastResolveValue: m.lastResolveValue,
+    lastResolvePayouts: m.lastResolvePayouts,
   };
 }
 
@@ -635,11 +681,22 @@ function deserializeMarket(data) {
   m.N = data.N; m.rangeMin = data.rangeMin; m.rangeMax = data.rangeMax;
   m.binWidth = data.binWidth; m.k = data.k;
   m.positions = data.positions; m.centers = data.centers;
+  m.tradeFeeBps = typeof data.tradeFeeBps === 'number' ? data.tradeFeeBps : DEFAULT_TRADE_FEE_BPS;
+  m.lpFeeSharePct = typeof data.lpFeeSharePct === 'number' ? data.lpFeeSharePct : DEFAULT_LP_FEE_SHARE_PCT;
+  m.redemptionFeeBps = typeof data.redemptionFeeBps === 'number' ? data.redemptionFeeBps : DEFAULT_REDEMPTION_FEE_BPS;
   m.totalLpShares = data.totalLpShares;
   m.lpProviders = data.lpProviders;
   m.accumulatedLpFees = data.accumulatedLpFees;
-  m.traders = data.traders;
+  m.traderHoldings = data.traderHoldings || {};
+  // Ensure per-market accounting fields exist on deserialized holdings
+  for (var name in m.traderHoldings) {
+    var th = m.traderHoldings[name];
+    if (th.spent === undefined) th.spent = 0;
+    if (th.received === undefined) th.received = 0;
+  }
   m.resolved = data.resolved; m.winningBin = data.winningBin;
+  m.lastResolveValue = data.lastResolveValue || null;
+  m.lastResolvePayouts = data.lastResolvePayouts || null;
   return m;
 }
 
@@ -655,22 +712,25 @@ function markChanged() {
 function saveState() {
   try {
     var state = {
-      version: 1,
+      version: 3,
+      globalTraders: JSON.parse(JSON.stringify(globalTraders)),
       markets: markets.map(function(entry) {
         return {
           id: entry.id, question: entry.question, actionCount: entry.actionCount,
-          market: serializeMarket(entry.market)
+          market: serializeMarket(entry.market),
+          tradeHistory: (entry.tradeHistory || []).slice(-500)
         };
       }),
       currentMarketIdx: currentMarketIdx,
       nextMarketId: nextMarketId,
-      actionLog: actionLogEntries.slice(-200), // keep last 200
+      actionLog: actionLogEntries.slice(-200),
+      settings: { fontSize: settings.fontSize, numberFormat: settings.numberFormat, decimalPrecision: settings.decimalPrecision },
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     stateHasChanged = false;
     var indicator = document.getElementById('saveIndicator');
     if (indicator) indicator.style.display = 'none';
-    showToast(currentLang === 'fa' ? 'ذخیره شد' : 'State saved', 'init');
+    showToast(currentLang === 'fa' ? '\u0630\u062E\u06CC\u0631\u0647 \u0634\u062F' : 'State saved', 'init');
   } catch (e) {
     showToast('Save failed: ' + e.message, 'sell');
   }
@@ -681,14 +741,26 @@ function loadState() {
     var raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return false;
     var state = JSON.parse(raw);
-    if (!state || state.version !== 1 || !Array.isArray(state.markets)) return false;
+    if (!state || !Array.isArray(state.markets)) return false;
+
+    // Restore global traders
+    globalTraders = state.globalTraders || {};
 
     markets = state.markets.map(function(entry) {
       return {
         id: entry.id, question: entry.question, actionCount: entry.actionCount || 0,
-        market: deserializeMarket(entry.market)
+        market: deserializeMarket(entry.market),
+        tradeHistory: entry.tradeHistory || []
       };
     });
+
+    // Restore settings
+    if (state.settings) {
+      if (state.settings.fontSize) settings.fontSize = state.settings.fontSize;
+      if (state.settings.numberFormat) settings.numberFormat = state.settings.numberFormat;
+      if (typeof state.settings.decimalPrecision === 'number') settings.decimalPrecision = state.settings.decimalPrecision;
+      applyFontSize(settings.fontSize);
+    }
     currentMarketIdx = state.currentMarketIdx;
     nextMarketId = state.nextMarketId || (markets.length + 1);
 
@@ -761,16 +833,8 @@ function toggleAutosave() {
 }
 
 function updateAutosaveUI() {
-  var label = document.getElementById('autosaveLabel');
-  if (!label) return;
   var dot = document.getElementById('autosaveDot');
-  if (autosaveEnabled) {
-    label.innerHTML = '<span class="lang-en">Auto</span><span class="lang-fa">\u062E\u0648\u062F\u06A9\u0627\u0631</span>';
-    if (dot) { dot.className = 'autosave-dot on'; }
-  } else {
-    label.innerHTML = '<span class="lang-en">Auto</span><span class="lang-fa">\u062E\u0648\u062F\u06A9\u0627\u0631</span>';
-    if (dot) { dot.className = 'autosave-dot off'; }
-  }
+  if (dot) { dot.className = 'autosave-dot ' + (autosaveEnabled ? 'on' : 'off'); }
 }
 
 function resetAllState() {
@@ -779,6 +843,7 @@ function resetAllState() {
     : 'Are you sure? All saved state will be erased.';
   if (!confirm(msg)) return;
   localStorage.removeItem(STORAGE_KEY);
+  globalTraders = {};
   markets = [];
   currentMarketIdx = -1;
   nextMarketId = 1;
@@ -790,6 +855,7 @@ function resetAllState() {
   document.getElementById('logCount').textContent = '(0)';
   resetPlaygroundUI();
   updateMarketSelector();
+  updateGlobalTradersList();
   var indicator = document.getElementById('saveIndicator');
   if (indicator) indicator.style.display = 'none';
   showToast(currentLang === 'fa' ? '\u0628\u0627\u0632\u0646\u0634\u0627\u0646\u06CC \u0634\u062F' : 'State reset', 'resolve');
@@ -850,14 +916,13 @@ function switchMarket(idxStr) {
   if (market.N > 64 && chartMode === 'bar') setChartMode('line', null);
 
   updatePlaygroundChart();
-  updatePortfolioDisplay();
+  updatePortfolioTab();
   updateResolveButton();
+  updateFeeDisplay();
 
   // Restore payouts display if resolved
-  if (market.resolved) {
-    var val = parseFloat(document.getElementById('pgResolveValue').value);
-    // We need to re-render payouts
-    renderResolvePayouts(market.resolve(val));
+  if (market.resolved && market.lastResolvePayouts) {
+    renderResolvePayouts({ winningBin: market.winningBin, payouts: market.lastResolvePayouts });
   } else {
     document.getElementById('payoutsSection').style.display = 'none';
     document.getElementById('payoutsSection').innerHTML = '';
@@ -882,9 +947,16 @@ function initPlayground() {
     markets[currentMarketIdx].actionCount = actionCount;
   }
 
+  // Get fees from the fee modal inputs
+  var fees = {
+    tradeFeeBps: parseInt(document.getElementById('feeTradeFeeBps').value) || 0,
+    lpFeeSharePct: parseInt(document.getElementById('feeLpFeeSharePct').value) || 0,
+    redemptionFeeBps: parseInt(document.getElementById('feeRedemptionFeeBps').value) || 0,
+  };
+
   // Create new market
-  var newMarket = new ContinuousMarket(N, rMin, rMax, L);
-  var entry = { id: nextMarketId++, question: question, market: newMarket, actionCount: 0 };
+  var newMarket = new ContinuousMarket(N, rMin, rMax, L, fees);
+  var entry = { id: nextMarketId++, question: question, market: newMarket, actionCount: 0, tradeHistory: [] };
   markets.push(entry);
   currentMarketIdx = markets.length - 1;
   market = newMarket;
@@ -910,7 +982,8 @@ function initPlayground() {
   updatePlaygroundStats();
   initTradePreviewControls();
   updateResolveButton();
-  updatePortfolioDisplay();
+  updatePortfolioTab();
+  updateFeeDisplay();
 
   addActionLog('init', 'Market #' + entry.id + ' created: N=' + N + ', [' + rMin + ', ' + rMax + '], L=' + L.toLocaleString(),
     'Q: ' + (question || '(none)') + ' | Bins: ' + N + ' | Width: ' + ((rMax - rMin) / N).toFixed(1) + ' | p: ' + (100 / N).toFixed(2) + '%');
@@ -918,7 +991,6 @@ function initPlayground() {
 }
 
 function resetPlayground() {
-  // Only resets the current market from UI, doesn't remove from list
   resetPlaygroundUI();
 }
 
@@ -939,10 +1011,11 @@ function resetPlaygroundUI() {
 }
 
 function hideTradeResults() {
-  var el1 = document.getElementById('discreteTradeResult');
-  var el2 = document.getElementById('distTradeResult');
-  if (el1) el1.style.display = 'none';
-  if (el2) el2.style.display = 'none';
+  var ids = ['discreteTradeResult', 'distTradeResult', 'discreteTradePreview', 'distTradePreview'];
+  for (var i = 0; i < ids.length; i++) {
+    var el = document.getElementById(ids[i]);
+    if (el) el.style.display = 'none';
+  }
 }
 
 function getActiveTrader() {
@@ -950,16 +1023,17 @@ function getActiveTrader() {
   return sel.value || '';
 }
 
-// -- Trader management --
-function addTraderUI() {
-  if (!market) { alert('Create a market first'); return; }
+// -- Global Trader management --
+function addGlobalTrader() {
   var name = document.getElementById('traderNameInput').value.trim();
   var balance = parseInt(document.getElementById('traderBalanceInput').value) || 500000;
   if (!name) { alert('Enter a trader name'); return; }
-  if (!market.addTrader(name, balance)) { alert('Trader already exists'); return; }
+  if (globalTraders[name]) { alert('Trader already exists'); return; }
+  globalTraders[name] = { wallet: balance };
+  updateGlobalTradersList();
   updateTraderSelect();
   updateParticipantsList();
-  addActionLog('init', 'Added trader: ' + name, 'Wallet: ' + balance.toLocaleString());
+  addActionLog('init', 'Added global trader: ' + name, 'Wallet: ' + balance.toLocaleString());
   document.getElementById('traderNameInput').value = '';
   markChanged();
 }
@@ -977,17 +1051,17 @@ function addLpUI() {
 }
 
 function topUpTrader() {
-  if (!market) return;
   var sel = document.getElementById('topUpTrader');
   var name = sel ? sel.value : '';
-  if (!name || !market.traders[name]) { alert('Select a trader'); return; }
+  if (!name || !globalTraders[name]) { alert('Select a trader'); return; }
   var amount = parseInt(document.getElementById('topUpAmount').value) || 0;
   if (amount <= 0) { alert('Enter a positive amount'); return; }
-  market.traders[name].wallet += amount;
+  globalTraders[name].wallet += amount;
   updateTraderSelect();
+  updateGlobalTradersList();
   updateParticipantsList();
-  updatePortfolioDisplay();
-  addActionLog('init', name + ' topped up +' + amount.toLocaleString(), 'New balance: ' + Math.floor(market.traders[name].wallet).toLocaleString());
+  updatePortfolioTab();
+  addActionLog('init', name + ' topped up +' + amount.toLocaleString(), 'New balance: ' + Math.floor(globalTraders[name].wallet).toLocaleString());
   markChanged();
 }
 
@@ -995,30 +1069,48 @@ function updateTopUpSelect() {
   var sel = document.getElementById('topUpTrader');
   if (!sel) return;
   sel.innerHTML = '';
-  if (!market) return;
-  for (var name in market.traders) {
+  for (var name in globalTraders) {
     var opt = document.createElement('option');
     opt.value = name;
-    opt.textContent = name + ' ($' + formatCompact(market.traders[name].wallet) + ')';
+    opt.textContent = name + ' ($' + formatCompact(globalTraders[name].wallet) + ')';
     sel.appendChild(opt);
   }
 }
 
 function updateTraderSelect() {
   var sel = document.getElementById('activeTrader');
+  var prev = sel.value;
   sel.innerHTML = '';
-  if (!market) return;
-  for (var name in market.traders) {
+  for (var name in globalTraders) {
     var opt = document.createElement('option');
     opt.value = name;
-    opt.textContent = name + ' ($' + formatCompact(market.traders[name].wallet) + ')';
+    opt.textContent = name + ' ($' + formatCompact(globalTraders[name].wallet) + ')';
     sel.appendChild(opt);
   }
+  if (prev && globalTraders[prev]) sel.value = prev;
   updateTopUpSelect();
+}
+
+function updateGlobalTradersList() {
+  var container = document.getElementById('globalTradersList');
+  if (!container) return;
+  var names = Object.keys(globalTraders);
+  if (names.length === 0) {
+    container.innerHTML = '<span style="color:var(--text-muted);font-size:0.8rem;">' + langText('No traders yet', '\u0647\u0646\u0648\u0632 \u0645\u0639\u0627\u0645\u0644\u0647\u200C\u06AF\u0631\u06CC \u0646\u06CC\u0633\u062A') + '</span>';
+    return;
+  }
+  var html = '<div class="participants-row">';
+  for (var i = 0; i < names.length; i++) {
+    var t = globalTraders[names[i]];
+    html += '<span class="participant-chip trader">' + names[i] + ' <span class="chip-balance">$' + formatCompact(t.wallet) + '</span></span>';
+  }
+  html += '</div>';
+  container.innerHTML = html;
 }
 
 function updateLpSelect() {
   var sel = document.getElementById('lpProviderSelect');
+  var prev = sel.value;
   sel.innerHTML = '';
   if (!market) return;
   for (var name in market.lpProviders) {
@@ -1027,15 +1119,19 @@ function updateLpSelect() {
     opt.textContent = name + ' (' + Math.floor(market.lpProviders[name].shares).toLocaleString() + ' shares)';
     sel.appendChild(opt);
   }
+  if (prev && market.lpProviders[prev]) sel.value = prev;
 }
 
 function updateParticipantsList() {
   var container = document.getElementById('participantsList');
   if (!market) { container.innerHTML = ''; return; }
   var html = '<div class="participants-row" style="margin-top:16px;">';
-  for (var name in market.traders) {
-    var t = market.traders[name];
-    html += '<span class="participant-chip trader">' + name + ' <span class="chip-balance">$' + formatCompact(t.wallet) + '</span></span>';
+
+  // Show global traders that have holdings in this market
+  for (var name in globalTraders) {
+    var t = globalTraders[name];
+    var hasHoldings = market.traderHoldings[name] && market.traderHoldings[name].holdings.some(function(h) { return h > 0.01; });
+    html += '<span class="participant-chip trader"' + (hasHoldings ? '' : ' style="opacity:0.5"') + '>' + name + ' <span class="chip-balance">$' + formatCompact(t.wallet) + '</span></span>';
   }
   for (var name in market.lpProviders) {
     var lp = market.lpProviders[name];
@@ -1050,76 +1146,91 @@ function updateParticipantsList() {
 }
 
 // -- Trade result display --
-function showDiscreteTradeResult(result, isBuy) {
+function showDiscreteTradeResult(result, isBuy, traderName) {
   var el = document.getElementById('discreteTradeResult');
   if (!el) return;
   el.style.display = '';
-  var html = '<div class="result-grid" style="margin:0;">';
+  el.className = 'trade-result';
+  var html = '<div class="result-grid result-grid-sm" style="margin:0;">';
   if (isBuy) {
-    html += resultItem('Tokens', formatCompact(result.tokensOut));
-    html += resultItem('Peak Payout', formatCompact(result.peakPayout), 'positive');
+    html += resultItemSm(langText('Tokens', '\u062A\u0648\u06A9\u0646'), formatCompact(result.tokensOut));
+    html += resultItemSm(langText('Peak Payout', '\u062D\u062F\u0627\u06A9\u062B\u0631'), formatCompact(result.peakPayout), 'positive');
     var profitPct = result.cost > 0 ? (result.maxProfit / result.cost * 100).toFixed(1) + '%' : '-';
-    html += resultItem('Max Profit', (result.maxProfit >= 0 ? '+' : '') + formatCompact(result.maxProfit) + ' (' + profitPct + ')', result.maxProfit >= 0 ? 'positive' : 'negative');
-    html += resultItem('Fee', formatCompact(result.fee));
+    html += resultItemSm(langText('Max Profit', '\u062D\u062F\u0627\u06A9\u062B\u0631 \u0633\u0648\u062F'), (result.maxProfit >= 0 ? '+' : '') + formatCompact(result.maxProfit) + ' (' + profitPct + ')', result.maxProfit >= 0 ? 'positive' : 'negative');
+    html += resultItemSm(langText('Fee', '\u06A9\u0627\u0631\u0645\u0632\u062F'), formatCompact(result.fee));
   } else {
-    html += resultItem('Received', '$' + formatCompact(result.collateralOut), 'positive');
-    html += resultItem('Tokens Returned', formatCompact(result.tokensReturned));
-    html += resultItem('Fee', formatCompact(result.fee));
+    html += resultItemSm(langText('Received', '\u062F\u0631\u06CC\u0627\u0641\u062A\u06CC'), '$' + formatCompact(result.collateralOut), 'positive');
+    html += resultItemSm(langText('Tokens Returned', '\u062A\u0648\u06A9\u0646 \u0628\u0627\u0632\u06AF\u0634\u062A\u06CC'), formatCompact(result.tokensReturned));
+    html += resultItemSm(langText('Fee', '\u06A9\u0627\u0631\u0645\u0632\u062F'), formatCompact(result.fee));
   }
   html += '</div>';
+  html += traderStateLine(traderName);
   el.innerHTML = html;
 }
 
-function showDistTradeResult(result, isBuy) {
+function showDistTradeResult(result, isBuy, traderName) {
   var el = document.getElementById('distTradeResult');
   if (!el) return;
   el.style.display = '';
-  var html = '<div class="result-grid" style="margin:0;">';
+  el.className = 'trade-result';
+  var html = '<div class="result-grid result-grid-sm" style="margin:0;">';
   if (isBuy) {
-    html += resultItem('Total Tokens', formatCompact(result.totalTokens));
-    html += resultItem('Peak Payout', formatCompact(result.peakPayout) + ' (bin ' + result.peakBin + ')', 'positive');
+    html += resultItemSm(langText('Total Tokens', '\u06A9\u0644 \u062A\u0648\u06A9\u0646'), formatCompact(result.totalTokens));
+    html += resultItemSm(langText('Peak Payout', '\u062D\u062F\u0627\u06A9\u062B\u0631') + ' (bin ' + result.peakBin + ')', formatCompact(result.peakPayout), 'positive');
     var profitPct = result.cost > 0 ? (result.maxProfit / result.cost * 100).toFixed(1) + '%' : '-';
-    html += resultItem('Max Profit', (result.maxProfit >= 0 ? '+' : '') + formatCompact(result.maxProfit) + ' (' + profitPct + ')', result.maxProfit >= 0 ? 'positive' : 'negative');
-    html += resultItem('Fee', formatCompact(result.fee));
+    html += resultItemSm(langText('Max Profit', '\u062D\u062F\u0627\u06A9\u062B\u0631 \u0633\u0648\u062F'), (result.maxProfit >= 0 ? '+' : '') + formatCompact(result.maxProfit) + ' (' + profitPct + ')', result.maxProfit >= 0 ? 'positive' : 'negative');
+    html += resultItemSm(langText('Fee', '\u06A9\u0627\u0631\u0645\u0632\u062F'), formatCompact(result.fee));
   } else {
-    html += resultItem('Received', '$' + formatCompact(result.collateralOut), 'positive');
-    html += resultItem('Tokens Sold', formatCompact(result.totalSold));
-    html += resultItem('Fee', formatCompact(result.fee));
+    html += resultItemSm(langText('Received', '\u062F\u0631\u06CC\u0627\u0641\u062A\u06CC'), '$' + formatCompact(result.collateralOut), 'positive');
+    html += resultItemSm(langText('Tokens Sold', '\u062A\u0648\u06A9\u0646 \u0641\u0631\u0648\u062E\u062A\u0647'), formatCompact(result.totalSold));
+    html += resultItemSm(langText('Fee', '\u06A9\u0627\u0631\u0645\u0632\u062F'), formatCompact(result.fee));
   }
   html += '</div>';
+  html += traderStateLine(traderName);
   el.innerHTML = html;
 }
 
-function resultItem(label, value, colorClass) {
-  return '<div class="result-item"><div class="result-label">' + label + '</div><div class="result-value ' + (colorClass || '') + '">' + value + '</div></div>';
+function traderStateLine(traderName) {
+  if (!traderName || !market || !globalTraders[traderName]) return '';
+  var p = market.getTraderPortfolio(traderName);
+  if (!p) return '';
+  var pnlSign = p.unrealizedPnL >= 0 ? '+' : '';
+  var pnlClass = p.unrealizedPnL >= 0 ? 'positive' : 'negative';
+  return '<div class="trade-result-footer">' + traderName + ': $' + formatCompact(p.wallet) + ' ' + langText('wallet', '\u06A9\u06CC\u0641 \u067E\u0648\u0644') +
+    ' &middot; P&L: <span class="' + pnlClass + '">' + pnlSign + formatCompact(p.unrealizedPnL) + ' (' + pnlSign + p.pnlPct.toFixed(1) + '%)</span></div>';
 }
 
-// -- Portfolio display --
-function updatePortfolioDisplay() {
-  var section = document.getElementById('portfolioSection');
-  if (!section) return;
-  if (!market) { section.style.display = 'none'; return; }
+// Refresh trader state footers in visible trade result sections when trader changes
+function updateTradeResultFooters() {
   var trader = getActiveTrader();
-  if (!trader || !market.traders[trader]) { section.style.display = 'none'; return; }
-  var p = market.getTraderPortfolio(trader);
-  if (!p || p.totalHoldings < 0.01) { section.style.display = 'none'; return; }
+  var ids = ['discreteTradeResult', 'distTradeResult'];
+  for (var i = 0; i < ids.length; i++) {
+    var el = document.getElementById(ids[i]);
+    if (!el || el.style.display === 'none') continue;
+    var footer = el.querySelector('.trade-result-footer');
+    if (footer) {
+      var newFooter = traderStateLine(trader);
+      if (newFooter) {
+        footer.outerHTML = newFooter;
+      } else {
+        footer.remove();
+      }
+    } else {
+      // No footer yet — append one if trader has portfolio data
+      var line = traderStateLine(trader);
+      if (line) el.insertAdjacentHTML('beforeend', line);
+    }
+  }
+}
 
-  section.style.display = '';
-  var body = document.getElementById('portfolioBody');
-  if (!body) return;
-
-  var pnlClass = p.unrealizedPnL >= 0 ? 'positive' : 'negative';
-  var pnlSign = p.unrealizedPnL >= 0 ? '+' : '';
-
-  var html = '<div class="result-grid" style="margin:0;">';
-  html += resultItem(langText('Total Invested', '\u0633\u0631\u0645\u0627\u06CC\u0647 \u06A9\u0644'), formatCompact(p.totalSpent));
-  html += resultItem(langText('Received (sells)', '\u062F\u0631\u06CC\u0627\u0641\u062A\u06CC (\u0641\u0631\u0648\u0634)'), formatCompact(p.totalReceived));
-  html += resultItem(langText('Expected Payout', '\u067E\u0631\u062F\u0627\u062E\u062A \u0645\u0648\u0631\u062F \u0627\u0646\u062A\u0638\u0627\u0631'), formatCompact(p.expectedPayout));
-  html += resultItem(langText('Peak Payout', '\u062D\u062F\u0627\u06A9\u062B\u0631 \u067E\u0631\u062F\u0627\u062E\u062A'), formatCompact(p.peakPayout) + ' (bin ' + p.peakBin + ')', 'positive');
-  html += resultItem(langText('Wallet', '\u06A9\u06CC\u0641 \u067E\u0648\u0644'), '$' + formatCompact(p.wallet));
-  html += resultItem(langText('Net P&L', '\u0633\u0648\u062F/\u0632\u06CC\u0627\u0646 \u062E\u0627\u0644\u0635'), pnlSign + formatCompact(p.unrealizedPnL) + ' (' + pnlSign + p.pnlPct.toFixed(1) + '%)', pnlClass);
-  html += '</div>';
-  body.innerHTML = html;
+function recordTrade(type, trader, detail, amount, result) {
+  if (!markets[currentMarketIdx]) return;
+  if (!markets[currentMarketIdx].tradeHistory) markets[currentMarketIdx].tradeHistory = [];
+  markets[currentMarketIdx].tradeHistory.push({
+    type: type, trader: trader, detail: detail,
+    amount: amount, result: result,
+    time: new Date().toTimeString().substring(0, 8)
+  });
 }
 
 function langText(en, fa) {
@@ -1135,8 +1246,9 @@ function refreshPreviews() {
 // -- Trade functions --
 function playgroundDiscreteBuy() {
   if (!market) { alert('Create a market first'); return; }
+  if (market.resolved) { alert('Market is resolved. Only re-resolving is allowed.'); return; }
   var trader = getActiveTrader();
-  if (!trader) { alert('Add and select a trader first'); return; }
+  if (!trader || !globalTraders[trader]) { alert('Add and select a trader first'); return; }
   var bin = parseInt(document.getElementById('pgDiscreteBin').value);
   var amount = parseInt(document.getElementById('pgDiscreteAmount').value);
   var result = market.discreteBuy(trader, bin, amount);
@@ -1145,15 +1257,17 @@ function playgroundDiscreteBuy() {
   var label = market.getLabels()[bin] || bin;
   addActionLog('buy', trader + ' bought bin ' + bin + ' [' + label + ']: ' + Math.floor(result.tokensOut).toLocaleString() + ' tokens',
     'Cost: ' + amount.toLocaleString() + ' | Fee: ' + result.fee.toLocaleString() + ' | Peak payout: ' + Math.floor(result.peakPayout).toLocaleString() + ' | New p: ' + (result.newProb * 100).toFixed(2) + '%');
-  showDiscreteTradeResult(result, true);
+  recordTrade('buy', trader, 'Bin ' + bin + ' [' + label + ']', amount, formatCompact(result.tokensOut) + ' tok, peak ' + formatCompact(result.peakPayout));
+  showDiscreteTradeResult(result, true, trader);
   afterTrade();
   markChanged();
 }
 
 function playgroundDiscreteSell() {
   if (!market) { alert('Create a market first'); return; }
+  if (market.resolved) { alert('Market is resolved. Only re-resolving is allowed.'); return; }
   var trader = getActiveTrader();
-  if (!trader) { alert('Add and select a trader first'); return; }
+  if (!trader || !globalTraders[trader]) { alert('Add and select a trader first'); return; }
   var bin = parseInt(document.getElementById('pgDiscreteBin').value);
   var tokens = parseFloat(document.getElementById('pgDiscreteAmount').value);
   var result = market.discreteSell(trader, bin, tokens);
@@ -1162,15 +1276,17 @@ function playgroundDiscreteSell() {
   var label = market.getLabels()[bin] || bin;
   addActionLog('sell', trader + ' sold ' + Math.floor(tokens).toLocaleString() + ' tokens from bin ' + bin + ' [' + label + ']',
     'Received: ' + Math.floor(result.collateralOut).toLocaleString() + ' | Fee: ' + result.fee.toLocaleString());
-  showDiscreteTradeResult(result, false);
+  recordTrade('sell', trader, 'Bin ' + bin + ' [' + label + ']', tokens, '$' + formatCompact(result.collateralOut) + ' received');
+  showDiscreteTradeResult(result, false, trader);
   afterTrade();
   markChanged();
 }
 
 function playgroundDistBuy() {
   if (!market) { alert('Create a market first'); return; }
+  if (market.resolved) { alert('Market is resolved. Only re-resolving is allowed.'); return; }
   var trader = getActiveTrader();
-  if (!trader) { alert('Add and select a trader first'); return; }
+  if (!trader || !globalTraders[trader]) { alert('Add and select a trader first'); return; }
   var mu = parseFloat(document.getElementById('pgDistMu').value);
   var sigma = parseFloat(document.getElementById('pgDistSigma').value);
   var amount = parseInt(document.getElementById('pgDistAmount').value);
@@ -1179,15 +1295,17 @@ function playgroundDistBuy() {
   actionCount++;
   addActionLog('buy', trader + ' dist-buy N(' + mu + ',' + sigma + '): ' + Math.floor(result.totalTokens).toLocaleString() + ' tokens',
     'Cost: ' + amount.toLocaleString() + ' | Fee: ' + result.fee.toLocaleString() + ' | Peak: ' + Math.floor(result.peakPayout).toLocaleString() + ' (bin ' + result.peakBin + ')');
-  showDistTradeResult(result, true);
+  recordTrade('dist-buy', trader, 'N(' + mu + ',' + sigma + ')', amount, formatCompact(result.totalTokens) + ' tok, peak ' + formatCompact(result.peakPayout));
+  showDistTradeResult(result, true, trader);
   afterTrade();
   markChanged();
 }
 
 function playgroundDistSell() {
   if (!market) { alert('Create a market first'); return; }
+  if (market.resolved) { alert('Market is resolved. Only re-resolving is allowed.'); return; }
   var trader = getActiveTrader();
-  if (!trader) { alert('Add and select a trader first'); return; }
+  if (!trader || !globalTraders[trader]) { alert('Add and select a trader first'); return; }
   var mu = parseFloat(document.getElementById('pgDistMu').value);
   var sigma = parseFloat(document.getElementById('pgDistSigma').value);
   var totalTokens = parseFloat(document.getElementById('pgDistAmount').value);
@@ -1196,13 +1314,15 @@ function playgroundDistSell() {
   actionCount++;
   addActionLog('sell', trader + ' dist-sell N(' + mu + ',' + sigma + '): ' + Math.floor(result.totalSold).toLocaleString() + ' tokens sold',
     'Received: ' + Math.floor(result.collateralOut).toLocaleString() + ' | Fee: ' + result.fee.toLocaleString());
-  showDistTradeResult(result, false);
+  recordTrade('dist-sell', trader, 'N(' + mu + ',' + sigma + ')', totalTokens, '$' + formatCompact(result.collateralOut) + ' received');
+  showDistTradeResult(result, false, trader);
   afterTrade();
   markChanged();
 }
 
 function playgroundAddLP() {
   if (!market) { alert('Create a market first'); return; }
+  if (market.resolved) { alert('Market is resolved. Only re-resolving is allowed.'); return; }
   var lpName = document.getElementById('lpProviderSelect').value;
   if (!lpName) { alert('Select an LP provider'); return; }
   var amount = parseInt(document.getElementById('lpAmount').value);
@@ -1212,12 +1332,14 @@ function playgroundAddLP() {
   actionCount++;
   addActionLog('lp', lpName + ' added ' + amount.toLocaleString() + ' liquidity',
     'Shares: ' + Math.floor(result.shares).toLocaleString() + ' | New k: ' + Math.floor(result.newK).toLocaleString() + ' | Ratio: ' + result.ratio.toFixed(6));
+  recordTrade('lp-add', lpName, formatCompact(result.shares) + ' shares', amount, 'k=' + formatCompact(result.newK));
   afterTrade();
   markChanged();
 }
 
 function playgroundRemoveLP() {
   if (!market) { alert('Create a market first'); return; }
+  if (market.resolved) { alert('Market is resolved. Only re-resolving is allowed.'); return; }
   var lpName = document.getElementById('lpProviderSelect').value;
   if (!lpName) { alert('Select an LP provider'); return; }
   var shares = parseFloat(document.getElementById('lpAmount').value);
@@ -1227,6 +1349,7 @@ function playgroundRemoveLP() {
   actionCount++;
   addActionLog('lp', lpName + ' removed ' + Math.floor(shares).toLocaleString() + ' LP shares',
     'Out: ' + Math.floor(result.collateralOut).toLocaleString() + ' | Fee share: ' + Math.floor(result.feeShare).toLocaleString() + ' | Total: ' + Math.floor(result.totalOut).toLocaleString());
+  recordTrade('lp-remove', lpName, formatCompact(shares) + ' shares', shares, '$' + formatCompact(result.totalOut) + ' out');
   afterTrade();
   markChanged();
 }
@@ -1238,17 +1361,18 @@ function afterTrade() {
   updateLpSelect();
   updateParticipantsList();
   refreshPreviews();
-  updatePortfolioDisplay();
+  updatePortfolioTab();
 }
 
 // -- Resolve / Re-resolve --
 function playgroundResolve() {
   if (!market) { alert('Create a market first'); return; }
+  var wasResolved = market.resolved;
   var val = parseFloat(document.getElementById('pgResolveValue').value);
   var result = market.resolve(val);
   var label = market.getLabels()[result.winningBin] || result.winningBin;
   actionCount++;
-  var prefix = market.resolved ? 'Re-resolved' : 'Resolved';
+  var prefix = wasResolved ? 'Re-resolved' : 'Resolved';
   addActionLog('resolve', prefix + ': value=' + val + ' -> bin ' + result.winningBin + ' [' + label + ']',
     'Payouts for ' + result.payouts.length + ' participants');
 
@@ -1475,6 +1599,7 @@ function syncDiscreteSlider(source) {
   var labels = market.getLabels();
   document.getElementById('discreteSliderCenter').textContent = labels[bin] || '';
   renderDiscretePreview();
+  updateDiscreteTradePreview();
 }
 
 function syncDistSliders(source) {
@@ -1502,6 +1627,7 @@ function syncDistSliders(source) {
                      '<span class="lang-fa">\u00B1' + formatCompact(sigma) + ' \u067E\u0648\u0634\u0634 \u06F6\u06F8\u066A \u067E\u06CC\u0634\u200C\u0628\u06CC\u0646\u06CC \u0634\u0645\u0627</span>';
   }
   renderDistPreview();
+  updateDistTradePreview();
 }
 
 function initTradePreviewControls() {
@@ -1698,8 +1824,6 @@ function updateDistortion() {
 // ============================================================
 // 18. GAUSSIAN DISCRETIZATION DEMO
 // ============================================================
-var gaussChartInstance = null;
-
 function initGaussianDemo() { updateGaussian(); }
 
 function updateGaussian() {
@@ -1783,16 +1907,40 @@ function updateLP() {
   var lpFeeRate = (feeBps / 10000) * (sharePercent / 100);
   var baselineLoss = 1 / Math.sqrt(bins);
   var baselineLossAmt = pool * baselineLoss;
-  var breakeven = baselineLossAmt / lpFeeRate;
-  var multiple = breakeven / pool;
+  var breakeven = lpFeeRate > 0 ? baselineLossAmt / lpFeeRate : Infinity;
+  var multiple = lpFeeRate > 0 ? breakeven / pool : Infinity;
 
   document.getElementById('lpLoss').textContent = '-' + (baselineLoss * 100).toFixed(1) + '%';
-  document.getElementById('lpBreakeven').textContent = '$' + formatCompact(breakeven);
-  document.getElementById('lpMultiple').textContent = Math.round(multiple) + 'x';
+  document.getElementById('lpBreakeven').textContent = isFinite(breakeven) ? '$' + formatCompact(breakeven) : '\u221E';
+  document.getElementById('lpMultiple').textContent = isFinite(multiple) ? Math.round(multiple) + 'x' : '\u221E';
 
   var ctx = document.getElementById('lpChart').getContext('2d');
   var c = getChartColors();
   if (lpChartInstance) lpChartInstance.destroy();
+
+  if (lpFeeRate <= 0) {
+    // With zero fees, LP always loses — show flat line
+    lpChartInstance = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: ['0', formatCompact(pool * 10)],
+        datasets: [{
+          label: 'LP Net Return (%)', data: [-(baselineLoss * 100), -(baselineLoss * 100)],
+          borderColor: c.danger, backgroundColor: c.danger + '20',
+          fill: true, tension: 0, pointRadius: 2, borderWidth: 2,
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: { duration: 400 },
+        scales: {
+          x: { title: { display: true, text: 'Total Volume', color: c.textMuted }, ticks: { color: c.textMuted }, grid: { display: false } },
+          y: { title: { display: true, text: 'Net Return (%)', color: c.textMuted }, ticks: { color: c.textMuted }, grid: { color: c.border + '30' } }
+        },
+        plugins: { legend: { display: false } }
+      }
+    });
+    return;
+  }
 
   var volumes = [], returns = [];
   var maxVol = breakeven * 3;
@@ -1831,14 +1979,460 @@ function updateLP() {
 // 20. UTILITIES
 // ============================================================
 function formatCompact(n) {
-  if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(1) + 'B';
-  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-  if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  var d = settings.decimalPrecision;
+  if (settings.numberFormat === 'long') {
+    var parts = Number(n).toFixed(d).split('.');
+    parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return d > 0 ? parts.join('.') : parts[0];
+  }
+  if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(d) + 'B';
+  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(d) + 'M';
+  if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(d) + 'K';
+  if (Math.abs(n) < 1 && n !== 0) return Number(n).toFixed(Math.max(d, 2));
   return Math.round(n).toString();
 }
 
+function resultItemSm(label, value, colorClass) {
+  return '<div class="result-item result-item-sm"><div class="result-label">' + label + '</div><div class="result-value result-value-sm ' + (colorClass || '') + '">' + value + '</div></div>';
+}
+
+function previewCell(label, value, colorClass) {
+  return '<div class="preview-cell"><div class="preview-cell-label">' + label + '</div><div class="preview-cell-value ' + (colorClass || '') + '">' + value + '</div></div>';
+}
+
 // ============================================================
-// 21. INITIALIZATION
+// 21. SETTINGS MODAL
+// ============================================================
+function openSettingsModal() {
+  var modal = document.getElementById('settingsModal');
+  if (!modal) return;
+  modal.classList.add('open');
+  document.querySelectorAll('input[name="setFontSize"]').forEach(function(r) { r.checked = r.value === settings.fontSize; });
+  document.querySelectorAll('input[name="setNumFmt"]').forEach(function(r) { r.checked = r.value === settings.numberFormat; });
+  var prec = document.getElementById('setPrecision');
+  if (prec) { prec.value = settings.decimalPrecision; }
+  var precVal = document.getElementById('setPrecisionVal');
+  if (precVal) precVal.textContent = settings.decimalPrecision;
+  var autoEl = document.getElementById('setAutosave');
+  if (autoEl) autoEl.checked = autosaveEnabled;
+}
+
+function closeSettingsModal() {
+  var modal = document.getElementById('settingsModal');
+  if (modal) modal.classList.remove('open');
+}
+
+function applySetting(key, value) {
+  if (key === 'fontSize') {
+    applyFontSize(value);
+  } else if (key === 'numberFormat') {
+    settings.numberFormat = value;
+  } else if (key === 'decimalPrecision') {
+    settings.decimalPrecision = Math.max(0, Math.min(6, parseInt(value) || 1));
+    var el = document.getElementById('setPrecisionVal');
+    if (el) el.textContent = settings.decimalPrecision;
+  } else if (key === 'autosave') {
+    if (autosaveEnabled !== !!value) toggleAutosave();
+    var autoEl = document.getElementById('setAutosave');
+    if (autoEl) autoEl.checked = autosaveEnabled;
+  } else if (key === 'theme') {
+    if ((value === 'light') !== (currentTheme === 'light')) toggleTheme();
+  } else if (key === 'language') {
+    if ((value === 'fa') !== (currentLang === 'fa')) toggleLanguage();
+  }
+  refreshAllDisplays();
+  markChanged();
+}
+
+function refreshAllDisplays() {
+  if (!market) return;
+  updatePlaygroundStats();
+  updateTraderSelect();
+  updateLpSelect();
+  updateParticipantsList();
+  updateGlobalTradersList();
+  refreshPreviews();
+  updatePortfolioTab();
+  updateDiscreteTradePreview();
+  updateDistTradePreview();
+}
+
+// ============================================================
+// 22. FEE CONFIGURATION MODAL
+// ============================================================
+function openFeeModal() {
+  var modal = document.getElementById('feeModal');
+  if (modal) modal.classList.add('open');
+}
+
+function closeFeeModal() {
+  var modal = document.getElementById('feeModal');
+  if (modal) modal.classList.remove('open');
+}
+
+function updateFeeDisplay() {
+  var el = document.getElementById('feeDisplayInfo');
+  if (!el || !market) { if (el) el.style.display = 'none'; return; }
+  el.style.display = '';
+  el.innerHTML = '<span style="font-size:0.75rem;color:var(--text-muted);">'
+    + langText('Fees', '\u06A9\u0627\u0631\u0645\u0632\u062F') + ': '
+    + langText('Trade', '\u0645\u0639\u0627\u0645\u0644\u0647') + ' ' + (market.tradeFeeBps / 100).toFixed(1) + '% | '
+    + langText('LP Share', '\u0633\u0647\u0645 LP') + ' ' + market.lpFeeSharePct + '% | '
+    + langText('Redemption', '\u0628\u0627\u0632\u062E\u0631\u06CC\u062F') + ' ' + (market.redemptionFeeBps / 100).toFixed(1) + '%'
+    + '</span>';
+}
+
+// ============================================================
+// 23. PORTFOLIO TAB
+// ============================================================
+function updatePortfolioTab() {
+  var container = document.getElementById('portfolioTabContent');
+  if (!container) return;
+  if (!market) { container.innerHTML = '<p style="color:var(--text-muted);font-size:0.85rem;">' + langText('Create a market and make trades to see portfolio data.', '\u06CC\u06A9 \u0628\u0627\u0632\u0627\u0631 \u0628\u0633\u0627\u0632\u06CC\u062F \u0648 \u0645\u0639\u0627\u0645\u0644\u0647 \u06A9\u0646\u06CC\u062F \u062A\u0627 \u062F\u0627\u062F\u0647\u200C\u0647\u0627\u06CC \u0633\u0628\u062F \u0631\u0627 \u0628\u0628\u06CC\u0646\u06CC\u062F.') + '</p>'; return; }
+
+  var html = '';
+
+  // === Trader Portfolio ===
+  var trader = getActiveTrader();
+  if (trader && globalTraders[trader]) {
+    var p = market.getTraderPortfolio(trader);
+    var th = market.traderHoldings[trader];
+
+    html += '<div class="portfolio-block">';
+    html += '<div class="portfolio-heading">' + langText('Trader: ', '\u0645\u0639\u0627\u0645\u0644\u0647\u200C\u06AF\u0631: ') + '<strong>' + trader + '</strong></div>';
+
+    // Summary cards
+    html += '<div class="result-grid result-grid-sm">';
+    html += resultItemSm(langText('Wallet', '\u06A9\u06CC\u0641 \u067E\u0648\u0644'), '$' + formatCompact(p.wallet));
+    html += resultItemSm(langText('Invested', '\u0633\u0631\u0645\u0627\u06CC\u0647'), '$' + formatCompact(p.totalSpent));
+    html += resultItemSm(langText('Received', '\u062F\u0631\u06CC\u0627\u0641\u062A\u06CC'), '$' + formatCompact(p.totalReceived));
+    html += resultItemSm(langText('Expected', '\u0645\u0648\u0631\u062F \u0627\u0646\u062A\u0638\u0627\u0631'), '$' + formatCompact(p.expectedPayout));
+    html += resultItemSm(langText('Peak Payout', '\u062D\u062F\u0627\u06A9\u062B\u0631'), '$' + formatCompact(p.peakPayout), 'positive');
+    var pnlSign = p.unrealizedPnL >= 0 ? '+' : '';
+    var pnlClass = p.unrealizedPnL >= 0 ? 'positive' : 'negative';
+    html += resultItemSm(langText('Net P&L', '\u0633\u0648\u062F/\u0632\u06CC\u0627\u0646'), pnlSign + formatCompact(p.unrealizedPnL) + ' (' + pnlSign + p.pnlPct.toFixed(1) + '%)', pnlClass);
+    html += '</div>';
+
+    // Holdings table
+    var hasHoldings = false;
+    if (th) {
+      for (var j = 0; j < market.N; j++) { if (th.holdings[j] > 0.01) { hasHoldings = true; break; } }
+    }
+    if (hasHoldings) {
+      var probs = market.getProbabilities();
+      var labels = market.getLabels();
+      html += '<div class="portfolio-sub">';
+      html += '<div class="portfolio-subheading">' + langText('Holdings', '\u062F\u0627\u0631\u0627\u06CC\u06CC\u200C\u0647\u0627') + '</div>';
+      html += '<div class="ptable-wrap"><table class="ptable">';
+      html += '<thead><tr>';
+      html += '<th>' + langText('Bin', '\u0628\u0627\u0632\u0647') + '</th>';
+      html += '<th>' + langText('Range', '\u0645\u062D\u062F\u0648\u062F\u0647') + '</th>';
+      html += '<th>' + langText('Tokens', '\u062A\u0648\u06A9\u0646') + '</th>';
+      html += '<th>' + langText('Prob', '\u0627\u062D\u062A\u0645\u0627\u0644') + '</th>';
+      html += '<th>' + langText('Exp. Value', '\u0627\u0631\u0632\u0634 \u0645\u0648\u0631\u062F \u0627\u0646\u062A\u0638\u0627\u0631') + '</th>';
+      html += '</tr></thead><tbody>';
+      for (var j = 0; j < market.N; j++) {
+        if (th.holdings[j] < 0.01) continue;
+        var ev = probs[j] * th.holdings[j] * (1 - market.redemptionFeeBps / 10000);
+        html += '<tr><td>' + j + '</td><td class="td-mono">' + labels[j] + '</td><td>' + formatCompact(th.holdings[j]) + '</td><td>' + (probs[j] * 100).toFixed(2) + '%</td><td>' + formatCompact(ev) + '</td></tr>';
+      }
+      html += '</tbody></table></div></div>';
+    }
+
+    // Trade history for this trader
+    var history = (markets[currentMarketIdx] && markets[currentMarketIdx].tradeHistory) || [];
+    var traderTrades = history.filter(function(h) { return h.trader === trader; });
+    if (traderTrades.length > 0) {
+      html += '<div class="portfolio-sub">';
+      html += '<div class="portfolio-subheading">' + langText('Trade History', '\u062A\u0627\u0631\u06CC\u062E\u0686\u0647 \u0645\u0639\u0627\u0645\u0644\u0627\u062A') + '</div>';
+      html += '<div class="ptable-wrap"><table class="ptable">';
+      html += '<thead><tr>';
+      html += '<th>#</th>';
+      html += '<th>' + langText('Type', '\u0646\u0648\u0639') + '</th>';
+      html += '<th>' + langText('Detail', '\u062C\u0632\u0626\u06CC\u0627\u062A') + '</th>';
+      html += '<th>' + langText('Amount', '\u0645\u0642\u062F\u0627\u0631') + '</th>';
+      html += '<th>' + langText('Result', '\u0646\u062A\u06CC\u062C\u0647') + '</th>';
+      html += '<th>' + langText('Time', '\u0632\u0645\u0627\u0646') + '</th>';
+      html += '</tr></thead><tbody>';
+      for (var i = traderTrades.length - 1; i >= 0; i--) {
+        var h = traderTrades[i];
+        var badgeClass = (h.type === 'buy' || h.type === 'dist-buy') ? 'badge-buy' : (h.type === 'sell' || h.type === 'dist-sell') ? 'badge-sell' : 'badge-lp';
+        html += '<tr>';
+        html += '<td>' + (i + 1) + '</td>';
+        html += '<td><span class="trade-badge ' + badgeClass + '">' + h.type + '</span></td>';
+        html += '<td>' + (h.detail || '-') + '</td>';
+        html += '<td>' + formatCompact(h.amount || 0) + '</td>';
+        html += '<td>' + (h.result || '-') + '</td>';
+        html += '<td class="td-mono td-time">' + (h.time || '') + '</td>';
+        html += '</tr>';
+      }
+      html += '</tbody></table></div></div>';
+    }
+    html += '</div>';
+  } else {
+    html += '<p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px;">' + langText('Select a trader in the toolbar above to see their portfolio.', '\u06CC\u06A9 \u0645\u0639\u0627\u0645\u0644\u0647\u200C\u06AF\u0631 \u0627\u0632 \u0646\u0648\u0627\u0631 \u0627\u0628\u0632\u0627\u0631 \u0628\u0627\u0644\u0627 \u0627\u0646\u062A\u062E\u0627\u0628 \u06A9\u0646\u06CC\u062F.') + '</p>';
+  }
+
+  // === Market Overview ===
+  html += '<div class="portfolio-block">';
+  html += '<div class="portfolio-heading">' + langText('Market Overview', '\u0646\u0645\u0627\u06CC \u06A9\u0644\u06CC \u0628\u0627\u0632\u0627\u0631') + '</div>';
+
+  html += '<div class="result-grid result-grid-sm">';
+  html += resultItemSm('k ' + langText('(Minted)', '(\u0636\u0631\u0628\u200C\u0634\u062F\u0647)'), formatCompact(market.k));
+  html += resultItemSm(langText('Bins', '\u0628\u0627\u0632\u0647\u200C\u0647\u0627'), market.N.toString());
+  html += resultItemSm(langText('Range', '\u0645\u062D\u062F\u0648\u062F\u0647'), formatCompact(market.rangeMin) + ' - ' + formatCompact(market.rangeMax));
+  html += resultItemSm(langText('LP Fees', '\u06A9\u0627\u0631\u0645\u0632\u062F LP'), formatCompact(market.accumulatedLpFees));
+  html += resultItemSm(langText('LP Shares', '\u0633\u0647\u0627\u0645 LP'), formatCompact(market.totalLpShares));
+  var sumSq = 0;
+  for (var i = 0; i < market.N; i++) sumSq += market.positions[i] * market.positions[i];
+  var drift = Math.abs(sumSq - market.k * market.k);
+  html += resultItemSm(langText('Invariant', '\u0646\u0627\u0648\u0631\u062F\u0627'), drift < 1 ? 'OK' : drift.toFixed(0), drift < 1 ? 'positive' : 'neutral');
+  html += '</div>';
+
+  // Fee info
+  html += '<div class="result-grid result-grid-sm">';
+  html += resultItemSm(langText('Trade Fee', '\u06A9\u0627\u0631\u0645\u0632\u062F \u0645\u0639\u0627\u0645\u0644\u0647'), (market.tradeFeeBps / 100).toFixed(1) + '%');
+  html += resultItemSm(langText('LP Fee Share', '\u0633\u0647\u0645 LP'), market.lpFeeSharePct + '%');
+  html += resultItemSm(langText('Redemption Fee', '\u06A9\u0627\u0631\u0645\u0632\u062F \u0628\u0627\u0632\u062E\u0631\u06CC\u062F'), (market.redemptionFeeBps / 100).toFixed(1) + '%');
+  html += '</div>';
+
+  // Collateral flow (per-market)
+  var totalIn = 0, totalOut = 0;
+  for (var name in market.traderHoldings) {
+    var th = market.traderHoldings[name];
+    totalIn += th.spent || 0;
+    totalOut += th.received || 0;
+  }
+  html += '<div class="result-grid result-grid-sm">';
+  html += resultItemSm(langText('Collateral In', '\u0648\u0631\u0648\u062F\u06CC'), '$' + formatCompact(totalIn));
+  html += resultItemSm(langText('Collateral Out', '\u062E\u0631\u0648\u062C\u06CC'), '$' + formatCompact(totalOut));
+  html += resultItemSm(langText('Net Flow', '\u062C\u0631\u06CC\u0627\u0646 \u062E\u0627\u0644\u0635'), '$' + formatCompact(totalIn - totalOut), (totalIn - totalOut) >= 0 ? 'positive' : 'negative');
+  html += '</div>';
+
+  // Top bins
+  var probs = market.getProbabilities();
+  var labels = market.getLabels();
+  var sorted = probs.map(function(p, i) { return { idx: i, prob: p }; }).sort(function(a, b) { return b.prob - a.prob; });
+  var topN = Math.min(5, sorted.length);
+  html += '<div class="portfolio-sub">';
+  html += '<div class="portfolio-subheading">' + langText('Top Bins by Probability', '\u0628\u0627\u0632\u0647\u200C\u0647\u0627\u06CC \u0628\u0631\u062A\u0631') + '</div>';
+  html += '<div class="ptable-wrap"><table class="ptable">';
+  html += '<thead><tr><th>' + langText('Bin', '\u0628\u0627\u0632\u0647') + '</th><th>' + langText('Range', '\u0645\u062D\u062F\u0648\u062F\u0647') + '</th><th>' + langText('Prob', '\u0627\u062D\u062A\u0645\u0627\u0644') + '</th><th>' + langText('Reserve (x)', '\u0630\u062E\u06CC\u0631\u0647 (x)') + '</th></tr></thead><tbody>';
+  for (var i = 0; i < topN; i++) {
+    var s = sorted[i];
+    html += '<tr><td>' + s.idx + '</td><td class="td-mono">' + labels[s.idx] + '</td><td>' + (s.prob * 100).toFixed(2) + '%</td><td>' + formatCompact(market.positions[s.idx]) + '</td></tr>';
+  }
+  html += '</tbody></table></div></div>';
+
+  // Participants
+  var traderNames = Object.keys(globalTraders);
+  var lpNames = Object.keys(market.lpProviders);
+  html += '<div class="portfolio-sub">';
+  html += '<div class="portfolio-subheading">' + langText('Participants', '\u0634\u0631\u06A9\u062A\u200C\u06A9\u0646\u0646\u062F\u06AF\u0627\u0646') + '</div>';
+  html += '<div style="font-size:0.8rem;color:var(--text-muted);">';
+  html += langText('Traders', '\u0645\u0639\u0627\u0645\u0644\u0647\u200C\u06AF\u0631\u0627\u0646') + ': ' + (traderNames.length > 0 ? traderNames.join(', ') : '-') + '<br>';
+  html += langText('LPs', '\u062A\u0623\u0645\u06CC\u0646\u200C\u06A9\u0646\u0646\u062F\u06AF\u0627\u0646') + ': ' + (lpNames.length > 0 ? lpNames.join(', ') : '-');
+  html += '</div></div>';
+
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+// ============================================================
+// 24. INTERACTIVE TRADE PREVIEW
+// ============================================================
+var discretePreviewMode = 'buy'; // 'buy' or 'sell'
+var distPreviewMode = 'buy';     // 'buy' or 'sell'
+
+function toggleDiscretePreviewMode() {
+  discretePreviewMode = (discretePreviewMode === 'buy') ? 'sell' : 'buy';
+  var btn = document.getElementById('discretePreviewToggle');
+  if (btn) {
+    btn.textContent = discretePreviewMode === 'buy' ? 'Buy ▸ Sell' : 'Sell ▸ Buy';
+    btn.className = 'btn btn-xs ' + (discretePreviewMode === 'buy' ? 'btn-outline' : 'btn-danger-outline');
+  }
+  updateDiscreteTradePreview();
+}
+
+function toggleDistPreviewMode() {
+  distPreviewMode = (distPreviewMode === 'buy') ? 'sell' : 'buy';
+  var btn = document.getElementById('distPreviewToggle');
+  if (btn) {
+    btn.textContent = distPreviewMode === 'buy' ? 'Buy ▸ Sell' : 'Sell ▸ Buy';
+    btn.className = 'btn btn-xs ' + (distPreviewMode === 'buy' ? 'btn-outline' : 'btn-danger-outline');
+  }
+  updateDistTradePreview();
+}
+
+function updateDiscreteTradePreview() {
+  var el = document.getElementById('discreteTradePreview');
+  if (!el || !market || market.resolved) { if (el) el.style.display = 'none'; return; }
+  var trader = getActiveTrader();
+  if (!trader || !globalTraders[trader]) { el.style.display = 'none'; return; }
+  var bin = parseInt(document.getElementById('pgDiscreteBin').value) || 0;
+  var amount = parseFloat(document.getElementById('pgDiscreteAmount').value) || 0;
+  if (amount <= 0 || bin < 0 || bin >= market.N) { el.style.display = 'none'; return; }
+
+  var html, fee, tokensOut, collateralOut, newProb;
+
+  if (discretePreviewMode === 'buy') {
+    // Buy preview: amount = collateral to spend
+    if (globalTraders[trader].wallet < amount) { el.style.display = 'none'; return; }
+    fee = Math.floor(amount * market.tradeFeeBps / 10000);
+    var net = amount - fee;
+    var kNew = market.k + net;
+    var sumOtherSq = 0;
+    for (var j = 0; j < market.N; j++) {
+      if (j !== bin) sumOtherSq += market.positions[j] * market.positions[j];
+    }
+    var disc = kNew * kNew - sumOtherSq;
+    if (disc < 0) { el.style.display = 'none'; return; }
+    var newXi = Math.sqrt(disc);
+    tokensOut = newXi - market.positions[bin];
+    var peakPayout = tokensOut * (1 - market.redemptionFeeBps / 10000);
+    var maxProfit = peakPayout - amount;
+    newProb = (newXi * newXi) / (kNew * kNew);
+
+    var profitPct = amount > 0 ? (maxProfit / amount * 100).toFixed(1) + '%' : '-';
+    html = '<div class="preview-header">' + langText('Buy Preview', '\u067E\u06CC\u0634\u200C\u0646\u0645\u0627\u06CC\u0634 \u062E\u0631\u06CC\u062F') + '</div>';
+    html += '<div class="preview-grid">';
+    html += previewCell(langText('Tokens', '\u062A\u0648\u06A9\u0646'), formatCompact(tokensOut));
+    html += previewCell(langText('Peak Payout', '\u062D\u062F\u0627\u06A9\u062B\u0631'), formatCompact(peakPayout));
+    html += previewCell(langText('Max Profit', '\u062D\u062F\u0627\u06A9\u062B\u0631 \u0633\u0648\u062F'), (maxProfit >= 0 ? '+' : '') + formatCompact(maxProfit) + ' (' + profitPct + ')', maxProfit >= 0 ? 'positive' : 'negative');
+    html += previewCell(langText('New Prob', '\u0627\u062D\u062A\u0645\u0627\u0644 \u062C\u062F\u06CC\u062F'), (newProb * 100).toFixed(2) + '%');
+    html += previewCell(langText('Fee', '\u06A9\u0627\u0631\u0645\u0632\u062F'), formatCompact(fee));
+    html += '</div>';
+  } else {
+    // Sell preview: amount = tokens to sell
+    var th = market.traderHoldings[trader];
+    if (!th || th.holdings[bin] < amount - 0.01) { el.style.display = 'none'; return; }
+    var newXiS = market.positions[bin] - amount;
+    if (newXiS < 0) { el.style.display = 'none'; return; }
+    var sumSq = 0;
+    for (var j = 0; j < market.N; j++) {
+      var xj = (j === bin) ? newXiS : market.positions[j];
+      sumSq += xj * xj;
+    }
+    var kNewS = Math.sqrt(sumSq);
+    var grossOut = market.k - kNewS;
+    fee = Math.floor(grossOut * market.tradeFeeBps / 10000);
+    collateralOut = grossOut - fee;
+    newProb = kNewS > 0 ? (newXiS * newXiS) / (kNewS * kNewS) : 0;
+
+    html = '<div class="preview-header">' + langText('Sell Preview', '\u067E\u06CC\u0634\u200C\u0646\u0645\u0627\u06CC\u0634 \u0641\u0631\u0648\u0634') + '</div>';
+    html += '<div class="preview-grid">';
+    html += previewCell(langText('Received', '\u062F\u0631\u06CC\u0627\u0641\u062A\u06CC'), '$' + formatCompact(collateralOut), 'positive');
+    html += previewCell(langText('Tokens Sold', '\u062A\u0648\u06A9\u0646 \u0641\u0631\u0648\u062E\u062A\u0647'), formatCompact(amount));
+    html += previewCell(langText('New Prob', '\u0627\u062D\u062A\u0645\u0627\u0644 \u062C\u062F\u06CC\u062F'), (newProb * 100).toFixed(2) + '%');
+    html += previewCell(langText('Fee', '\u06A9\u0627\u0631\u0645\u0632\u062F'), formatCompact(fee));
+    html += '</div>';
+  }
+
+  el.style.display = '';
+  el.className = 'trade-result trade-preview-mode';
+  html += previewTraderBar(trader);
+  el.innerHTML = html;
+}
+
+function updateDistTradePreview() {
+  var el = document.getElementById('distTradePreview');
+  if (!el || !market || market.resolved) { if (el) el.style.display = 'none'; return; }
+  var trader = getActiveTrader();
+  if (!trader || !globalTraders[trader]) { el.style.display = 'none'; return; }
+  var mu = parseFloat(document.getElementById('pgDistMu').value) || 0;
+  var sigma = parseFloat(document.getElementById('pgDistSigma').value) || 1;
+  var amount = parseFloat(document.getElementById('pgDistAmount').value) || 0;
+  if (amount <= 0) { el.style.display = 'none'; return; }
+
+  var html, fee;
+
+  if (distPreviewMode === 'buy') {
+    // Buy preview: amount = collateral
+    if (globalTraders[trader].wallet < amount) { el.style.display = 'none'; return; }
+    fee = Math.floor(amount * market.tradeFeeBps / 10000);
+    var net = amount - fee;
+    var W = market._computeWeights(mu, sigma);
+    if (!W) { el.style.display = 'none'; return; }
+
+    var XW = 0, W2 = 0;
+    for (var j = 0; j < market.N; j++) { XW += market.positions[j] * W[j]; W2 += W[j] * W[j]; }
+    var kNew = market.k + net;
+    var excess = kNew * kNew - market.k * market.k;
+    var discrim = XW * XW + W2 * excess;
+    if (discrim < 0) { el.style.display = 'none'; return; }
+    var lambda = Math.sqrt(discrim) - XW;
+
+    var totalTokens = 0, maxTokens = 0, peakBin = 0;
+    for (var j = 0; j < market.N; j++) {
+      var t = (lambda * W[j]) / W2;
+      totalTokens += t;
+      if (t > maxTokens) { maxTokens = t; peakBin = j; }
+    }
+    var peakPayout = maxTokens * (1 - market.redemptionFeeBps / 10000);
+    var maxProfit = peakPayout - amount;
+
+    var profitPct = amount > 0 ? (maxProfit / amount * 100).toFixed(1) + '%' : '-';
+    html = '<div class="preview-header">' + langText('Buy Preview', '\u067E\u06CC\u0634\u200C\u0646\u0645\u0627\u06CC\u0634 \u062E\u0631\u06CC\u062F') + '</div>';
+    html += '<div class="preview-grid">';
+    html += previewCell(langText('Tokens', '\u06A9\u0644 \u062A\u0648\u06A9\u0646'), formatCompact(totalTokens));
+    html += previewCell(langText('Peak Payout', '\u062D\u062F\u0627\u06A9\u062B\u0631') + ' (bin ' + peakBin + ')', formatCompact(peakPayout));
+    html += previewCell(langText('Max Profit', '\u062D\u062F\u0627\u06A9\u062B\u0631 \u0633\u0648\u062F'), (maxProfit >= 0 ? '+' : '') + formatCompact(maxProfit) + ' (' + profitPct + ')', maxProfit >= 0 ? 'positive' : 'negative');
+    html += previewCell(langText('Fee', '\u06A9\u0627\u0631\u0645\u0632\u062F'), formatCompact(fee));
+    html += '</div>';
+  } else {
+    // Sell preview: amount = total tokens to sell (distributed by weights)
+    var th = market.traderHoldings[trader];
+    if (!th) { el.style.display = 'none'; return; }
+    var W = market._computeWeights(mu, sigma);
+    if (!W) { el.style.display = 'none'; return; }
+
+    var tokensPerBin = [];
+    var totalSold = 0;
+    for (var j = 0; j < market.N; j++) {
+      var t = amount * W[j] / SCALE_WEIGHT;
+      t = Math.min(t, th.holdings[j]);
+      t = Math.min(t, market.positions[j]);
+      tokensPerBin.push(t);
+      totalSold += t;
+    }
+    if (totalSold < 0.01) { el.style.display = 'none'; return; }
+
+    var sumSq = 0;
+    for (var j = 0; j < market.N; j++) {
+      var xj = market.positions[j] - tokensPerBin[j];
+      sumSq += xj * xj;
+    }
+    var kNewS = Math.sqrt(sumSq);
+    var grossOut = market.k - kNewS;
+    fee = Math.floor(grossOut * market.tradeFeeBps / 10000);
+    var collateralOut = grossOut - fee;
+
+    html = '<div class="preview-header">' + langText('Sell Preview', '\u067E\u06CC\u0634\u200C\u0646\u0645\u0627\u06CC\u0634 \u0641\u0631\u0648\u0634') + '</div>';
+    html += '<div class="preview-grid">';
+    html += previewCell(langText('Received', '\u062F\u0631\u06CC\u0627\u0641\u062A\u06CC'), '$' + formatCompact(collateralOut), 'positive');
+    html += previewCell(langText('Tokens Sold', '\u062A\u0648\u06A9\u0646 \u0641\u0631\u0648\u062E\u062A\u0647'), formatCompact(totalSold));
+    html += previewCell(langText('Fee', '\u06A9\u0627\u0631\u0645\u0632\u062F'), formatCompact(fee));
+    html += '</div>';
+  }
+
+  el.style.display = '';
+  el.className = 'trade-result trade-preview-mode';
+  html += previewTraderBar(trader);
+  el.innerHTML = html;
+}
+
+// Shared trader bar for previews — always shows current trader state
+function previewTraderBar(traderName) {
+  if (!traderName || !market || !globalTraders[traderName]) return '';
+  var p = market.getTraderPortfolio(traderName);
+  if (!p || p.totalSpent <= 0) return '';
+  var pnlSign = p.unrealizedPnL >= 0 ? '+' : '';
+  return '<div class="preview-trader-bar">' + traderName + ': $' + formatCompact(p.wallet) + ' ' + langText('wallet', '\u06A9\u06CC\u0641 \u067E\u0648\u0644') +
+    ' &middot; P&L: ' + pnlSign + formatCompact(p.unrealizedPnL) + ' (' + pnlSign + p.pnlPct.toFixed(1) + '%)</div>';
+}
+
+// ============================================================
+// 25. INITIALIZATION
 // ============================================================
 window.addEventListener('DOMContentLoaded', function() {
   // TOC observers
@@ -1867,6 +2461,7 @@ window.addEventListener('DOMContentLoaded', function() {
   var loaded = loadState();
   if (loaded && markets.length > 0) {
     updateMarketSelector();
+    updateGlobalTradersList();
     if (market) {
       document.getElementById('pgResults').style.display = '';
       document.getElementById('pgChartContainer').style.display = '';
@@ -1877,12 +2472,21 @@ window.addEventListener('DOMContentLoaded', function() {
       initTradePreviewControls();
       updatePlaygroundStats();
       updateResolveButton();
-      updatePortfolioDisplay();
+      updatePortfolioTab();
+      updateFeeDisplay();
       setTimeout(function() { updatePlaygroundChart(); }, 100);
+      // Restore resolve payouts if market was resolved
+      if (market.resolved && market.lastResolvePayouts) {
+        renderResolvePayouts({ winningBin: market.winningBin, payouts: market.lastResolvePayouts });
+        if (market.lastResolveValue !== null) {
+          document.getElementById('pgResolveValue').value = market.lastResolveValue;
+        }
+      }
     }
     showToast(currentLang === 'fa' ? '\u0628\u0627\u0632\u06CC\u0627\u0628\u06CC \u0634\u062F' : 'State restored (' + markets.length + ' market' + (markets.length > 1 ? 's' : '') + ')', 'init');
   } else {
     updateMarketSelector();
+    updateGlobalTradersList();
   }
 
   // Init demos
